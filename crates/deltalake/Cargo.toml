@@ -22,6 +22,7 @@ features = [
     "python",
     "s3",
     "unity-experimental",
+    "hdlfs"
 ]
 
 [dependencies]
@@ -33,6 +34,7 @@ deltalake-hdfs = { version = "0.10.0", path = "../hdfs", optional = true }
 deltalake-lakefs = { version = "0.9.0", path = "../lakefs", optional = true }
 deltalake-catalog-glue = { version = "0.10.0", path = "../catalog-glue", optional = true }
 deltalake-catalog-unity = { version = "0.10.0", path = "../catalog-unity", optional = true }
+deltalake-hdlfs = { version = "0.1.0", path = "../hdlfs", optional = true }
 delta_kernel = { workspace = true }
 
 
@@ -54,6 +56,7 @@ unity-experimental = ["deltalake-catalog-unity"]
 lakefs = ["deltalake-lakefs"]
 native-tls = ["deltalake-core/native-tls"]
 rustls = ["deltalake-core/rustls"]
+hdlfs =  ["deltalake-hdlfs"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

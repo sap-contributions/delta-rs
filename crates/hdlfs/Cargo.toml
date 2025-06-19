@@ -1,0 +1,47 @@
+[package]
+name = "deltalake-hdlfs"
+version = "0.1.0"
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+readme.workspace = true
+edition.workspace = true
+description.workspace = true
+homepage.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+
+[dependencies]
+deltalake-core = { version = "0.26.0", path = "../core" }
+
+# workspace depenndecies
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+object_store = { workspace = true, features = ["hdlfs"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+regex = { workspace = true }
+url = { workspace = true }
+
+
+[dev-dependencies]
+deltalake-core = { version = "0.26.0", path = "../core", features = [
+    "datafusion",
+] }
+chrono = { workspace = true }
+serial_test = "3"
+deltalake-test = { path = "../test" }
+pretty_env_logger = "0.5.0"
+rand = "0.8"
+serde_json = { workspace = true }
+
+[features]
+integration_test = []
+
+
+# local object_store
+[patch.crates-io]
+object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store/", branch = "hdlfs"  }

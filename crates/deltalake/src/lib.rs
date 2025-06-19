@@ -18,3 +18,5 @@ pub use deltalake_gcp as gcp;
 pub use deltalake_hdfs as hdfs;
 #[cfg(feature = "lakefs")]
 pub use deltalake_lakefs as lakefs;
+#[cfg(feature = "hdlfs")]
+pub use deltalake_hdlfs as hdlfs;

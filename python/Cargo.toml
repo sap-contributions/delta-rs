@@ -87,6 +87,7 @@ features = [
     "unity-experimental",
     "hdfs",
     "lakefs",
+    "hdlfs"
 ]
 
 [features]
