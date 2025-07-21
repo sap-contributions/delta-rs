@@ -45,7 +45,7 @@ impl ObjectStoreFactory for HdlfsFactory {
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
         let config = config::SAPHdlfsConfigHelper::try_new(options.as_hdlfs_options())?.build()?;
 
-        let mut builder = SAPHdlfsBuilder::new()
+        let mut builder = SAPHdlfsBuilder::from_env()
             .with_url(url.to_string())
             .with_retry(retry.clone());
         for (key, value) in config.iter() {
