@@ -110,3 +110,7 @@ debug = true
 [profile.profiling]
 inherits = "release"
 debug = true
+
+[patch.crates-io]
+object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store.git", branch = "hdlfs"}
+

@@ -22,6 +22,7 @@ features = [
     "python",
     "s3",
     "unity-experimental",
+    "hdlfs",
 ]
 
 [dependencies]
@@ -34,7 +35,7 @@ deltalake-lakefs = { version = "0.12.0", path = "../lakefs", optional = true }
 deltalake-catalog-glue = { version = "0.13.0", path = "../catalog-glue", optional = true }
 deltalake-catalog-unity = { version = "0.13.0", path = "../catalog-unity", optional = true }
 delta_kernel = { workspace = true }
-
+deltalake-hdlfs = { version = "0.1.0", path = "../hdlfs", optional = true }
 
 [features]
 # All of these features are just reflected into the core crate until that
@@ -54,6 +55,7 @@ unity-experimental = ["deltalake-catalog-unity"]
 lakefs = ["deltalake-lakefs"]
 native-tls = ["deltalake-core/native-tls"]
 rustls = ["deltalake-core/rustls"]
+hdlfs =  ["deltalake-hdlfs"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
