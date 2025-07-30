@@ -16,6 +16,8 @@ pub use deltalake_catalog_unity as unity_catalog;
 pub use deltalake_gcp as gcp;
 #[cfg(feature = "hdfs")]
 pub use deltalake_hdfs as hdfs;
+#[cfg(feature = "hdlfs")]
+pub use deltalake_hdlfs as hdlfs;
 #[cfg(feature = "lakefs")]
 pub use deltalake_lakefs as lakefs;
 
@@ -64,5 +66,13 @@ mod __deltalake_auto_register_unity {
     #[ctor::ctor]
     fn register() {
         crate::unity_catalog::register_handlers(None);
+    }
+}
+
+#[cfg(feature = "hdlfs")]
+mod __deltalake_auto_register_hdlfs {
+    #[ctor::ctor]
+    fn register() {
+        crate::hdlfs::register_handlers(None);
     }
 }

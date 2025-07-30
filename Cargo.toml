@@ -155,3 +155,6 @@ inherits = "release"
 opt-level = 3
 codegen-units = 1
 lto = "thin"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store.git", branch = "hdlfs-14x-012x"}
