@@ -8,8 +8,7 @@ use deltalake_core::logstore::{
 };
 use deltalake_core::{DeltaResult, DeltaTableError, Path};
 use object_store::hdlfs::{SAPHdlfsBuilder, SAPHdlfsConfigKey};
-use object_store::{ObjectStoreScheme, RetryConfig};
-use tokio::runtime::Handle;
+use object_store::{ObjectStoreScheme};
 use url::Url;
 
 mod config;
@@ -39,16 +38,13 @@ impl ObjectStoreFactory for HdlfsFactory {
     fn parse_url_opts(
         &self,
         url: &Url,
-        options: &HashMap<String, String>,
-        retry: &RetryConfig,
-        handle: Option<Handle>,
+        config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
-        let config = config::SAPHdlfsConfigHelper::try_new(options.as_hdlfs_options())?.build()?;
+        let config = config::SAPHdlfsConfigHelper::try_new(config.raw.as_hdlfs_options())?.build()?;
 
         //Stefan Ruck fix the issue: Enable usage of env variables for configuration.
         let mut builder = SAPHdlfsBuilder::from_env()
-            .with_url(url.to_string())
-            .with_retry(retry.clone());
+            .with_url(url.to_string());
         for (key, value) in config.iter() {
             builder = builder.with_config(*key, value.clone());
         }
