@@ -95,3 +95,6 @@ Arro3 = "Arro3"
 AKS = "AKS"
 # to avoid using 'type' as a field name.
 tpe = "tpe"
+
+[patch.crates-io]
+object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store.git", branch = "hdlfs"}
