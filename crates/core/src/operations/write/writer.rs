@@ -7,6 +7,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use bytes::Bytes;
 use delta_kernel::expressions::Scalar;
+use delta_kernel::table_properties::DataSkippingNumIndexedCols;
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use object_store::{path::Path, ObjectStore};
@@ -14,10 +15,11 @@ use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::*;
 
 use super::async_utils::AsyncShareableBuffer;
 use crate::crate_version;
+
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::{Add, PartitionsExt};
 use crate::logstore::ObjectStoreRef;
@@ -107,7 +109,7 @@ pub struct WriterConfig {
     /// determine how fine granular we can track / control the size of resulting files.
     write_batch_size: usize,
     /// Num index cols to collect stats for
-    num_indexed_cols: i32,
+    num_indexed_cols: DataSkippingNumIndexedCols,
     /// Stats columns, specific columns to collect stats from, takes precedence over num_indexed_cols
     stats_columns: Option<Vec<String>>,
 }
@@ -120,7 +122,7 @@ impl WriterConfig {
         writer_properties: Option<WriterProperties>,
         target_file_size: Option<usize>,
         write_batch_size: Option<usize>,
-        num_indexed_cols: i32,
+        num_indexed_cols: DataSkippingNumIndexedCols,
         stats_columns: Option<Vec<String>>,
     ) -> Self {
         let writer_properties = writer_properties.unwrap_or_else(|| {
@@ -320,7 +322,7 @@ pub struct PartitionWriter {
     part_counter: usize,
     files_written: Vec<Add>,
     /// Num index cols to collect stats for
-    num_indexed_cols: i32,
+    num_indexed_cols: DataSkippingNumIndexedCols,
     /// Stats columns, specific columns to collect stats from, takes precedence over num_indexed_cols
     stats_columns: Option<Vec<String>>,
 }
@@ -330,7 +332,7 @@ impl PartitionWriter {
     pub fn try_with_config(
         object_store: ObjectStoreRef,
         config: PartitionWriterConfig,
-        num_indexed_cols: i32,
+        num_indexed_cols: DataSkippingNumIndexedCols,
         stats_columns: Option<Vec<String>>,
     ) -> DeltaResult<Self> {
         let buffer = AsyncShareableBuffer::default();
@@ -383,6 +385,7 @@ impl PartitionWriter {
         Ok(self.arrow_writer.write(batch).await?)
     }
 
+    #[instrument(skip(self), fields(rows = 0, size = 0, path = field::Empty))]
     async fn flush_arrow_writer(&mut self) -> DeltaResult<()> {
         // replace counter / buffers and close the current writer
         let (writer, buffer) = self.reset_writer()?;
@@ -401,12 +404,17 @@ impl PartitionWriter {
         let path = self.next_data_path();
         let file_size = buffer.len() as i64;
 
+        Span::current().record("rows", metadata.num_rows);
+        Span::current().record("size", file_size);
+        Span::current().record("path", path.as_ref());
+
         // write file to object store
         let mut multi_part_upload = self.object_store.put_multipart(&path).await?;
         let part_size = upload_part_size();
         let mut tasks = JoinSet::new();
         let max_concurrent_tasks = 10; // TODO: make configurable
 
+        let mut part_count = 0;
         while buffer.len() > part_size {
             let part = buffer.split_to(part_size);
             let upload_future = multi_part_upload.put_part(part.into());
@@ -416,12 +424,16 @@ impl PartitionWriter {
                 tasks.join_next().await;
             }
             tasks.spawn(upload_future);
+            part_count += 1;
         }
 
         if !buffer.is_empty() {
             let upload_future = multi_part_upload.put_part(buffer.into());
             tasks.spawn(upload_future);
+            part_count += 1;
         }
+
+        debug!(parts = part_count, path = %path, "uploading multipart file");
 
         // wait for all remaining tasks to complete
         while let Some(result) = tasks.join_next().await {
@@ -429,6 +441,7 @@ impl PartitionWriter {
         }
 
         multi_part_upload.complete().await?;
+        debug!(path = %path, "multipart upload completed successfully");
 
         self.files_written.push(
             create_add(
@@ -507,7 +520,7 @@ mod tests {
             writer_properties,
             target_file_size,
             write_batch_size,
-            DEFAULT_NUM_INDEX_COLS,
+            DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEX_COLS),
             None,
         );
         DeltaWriter::new(object_store, config)
@@ -528,13 +541,19 @@ mod tests {
             write_batch_size,
         )
         .unwrap();
-        PartitionWriter::try_with_config(object_store, config, DEFAULT_NUM_INDEX_COLS, None)
-            .unwrap()
+        PartitionWriter::try_with_config(
+            object_store,
+            config,
+            DataSkippingNumIndexedCols::NumColumns(DEFAULT_NUM_INDEX_COLS),
+            None,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
     async fn test_write_partition() {
-        let log_store = DeltaTableBuilder::from_uri("memory:///")
+        let log_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+            .unwrap()
             .build_storage()
             .unwrap();
         let object_store = log_store.object_store(None);
@@ -566,7 +585,8 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![base_str, base_int]).unwrap();
 
-        let object_store = DeltaTableBuilder::from_uri("memory:///")
+        let object_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+            .unwrap()
             .build_storage()
             .unwrap()
             .object_store(None);
@@ -597,7 +617,8 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![base_str, base_int]).unwrap();
 
-        let object_store = DeltaTableBuilder::from_uri("memory:///")
+        let object_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+            .unwrap()
             .build_storage()
             .unwrap()
             .object_store(None);
@@ -624,7 +645,8 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(schema, vec![base_str, base_int]).unwrap();
 
-        let object_store = DeltaTableBuilder::from_uri("memory:///")
+        let object_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+            .unwrap()
             .build_storage()
             .unwrap()
             .object_store(None);
@@ -639,7 +661,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_mismatched_schema() {
-        let log_store = DeltaTableBuilder::from_uri("memory:///")
+        let log_store = DeltaTableBuilder::from_uri(url::Url::parse("memory:///").unwrap())
+            .unwrap()
             .build_storage()
             .unwrap();
         let object_store = log_store.object_store(None);

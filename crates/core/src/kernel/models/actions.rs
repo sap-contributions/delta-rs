@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use delta_kernel::schema::{DataType, StructField};
 use delta_kernel::table_features::{ReaderFeature, WriterFeature};
-use maplit::hashset;
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::{error::Error, DeltaResult};
@@ -51,7 +50,7 @@ pub trait MetadataExt {
 
     fn add_config_key(self, key: String, value: String) -> DeltaResult<Metadata>;
 
-    fn remove_config_key(self, key: &String) -> DeltaResult<Metadata>;
+    fn remove_config_key(self, key: &str) -> DeltaResult<Metadata>;
 }
 
 impl MetadataExt for Metadata {
@@ -127,7 +126,7 @@ impl MetadataExt for Metadata {
         Ok(serde_json::from_value(value)?)
     }
 
-    fn remove_config_key(self, key: &String) -> DeltaResult<Metadata> {
+    fn remove_config_key(self, key: &str) -> DeltaResult<Metadata> {
         let mut config = self.configuration().clone();
         config.remove(key);
         let value = serde_json::json!({
@@ -341,7 +340,7 @@ impl ProtocolInner {
         mut self,
         configuration: &HashMap<String, String>,
     ) -> Self {
-        fn parse_bool(value: &String) -> bool {
+        fn parse_bool(value: &str) -> bool {
             value.to_ascii_lowercase().parse::<bool>().is_ok_and(|v| v)
         }
 
@@ -497,7 +496,7 @@ impl ProtocolInner {
                             }
                             None => {
                                 self.writer_features =
-                                    Some(hashset! {WriterFeature::ChangeDataFeed})
+                                    Some(HashSet::from([WriterFeature::ChangeDataFeed]))
                             }
                         }
                     } else if self.min_writer_version <= 3 {
@@ -520,14 +519,14 @@ impl ProtocolInner {
                             features.insert(WriterFeature::DeletionVectors);
                             features
                         }
-                        None => hashset! {WriterFeature::DeletionVectors},
+                        None => HashSet::from([WriterFeature::DeletionVectors]),
                     };
                     let reader_features = match self.reader_features {
                         Some(mut features) => {
                             features.insert(ReaderFeature::DeletionVectors);
                             features
                         }
-                        None => hashset! {ReaderFeature::DeletionVectors},
+                        None => HashSet::from([ReaderFeature::DeletionVectors]),
                     };
                     self.min_reader_version = 3;
                     self.min_writer_version = 7;

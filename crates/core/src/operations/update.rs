@@ -25,10 +25,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use datafusion::common::{Column, ScalarValue};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::{
     case, col, lit, when, Expr, Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode,
+};
+use datafusion::{
+    catalog::Session,
+    common::{Column, ScalarValue},
 };
 use datafusion::{
     dataframe::DataFrame,
@@ -51,19 +54,26 @@ use super::{
     write::execution::{write_execution_plan, write_execution_plan_cdc},
     CustomExecuteHandler, Operation,
 };
-use crate::delta_datafusion::{
-    expr::fmt_expr_to_sql,
-    logical::MetricObserver,
-    physical::{find_metric_node, get_metric, MetricObserverExec},
-    DataFusionMixins, DeltaColumn, DeltaScanConfigBuilder, DeltaSessionContext, DeltaTableProvider,
-};
-use crate::delta_datafusion::{find_files, planner::DeltaPlanner, register_store};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, Remove};
 use crate::logstore::LogStoreRef;
 use crate::operations::cdc::*;
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
+use crate::{
+    delta_datafusion::{
+        expr::fmt_expr_to_sql,
+        logical::MetricObserver,
+        physical::{find_metric_node, get_metric, MetricObserverExec},
+        DataFusionMixins, DeltaColumn, DeltaScanConfigBuilder, DeltaSessionContext,
+        DeltaTableProvider,
+    },
+    table::config::TablePropertiesExt,
+};
+use crate::{
+    delta_datafusion::{find_files, planner::DeltaPlanner, register_store},
+    kernel::EagerSnapshot,
+};
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 /// Custom column name used for marking internal [RecordBatch] rows as updated
@@ -81,11 +91,11 @@ pub struct UpdateBuilder {
     /// How to update columns in a record that match the predicate
     updates: HashMap<Column, Expression>,
     /// A snapshot of the table's state
-    snapshot: DeltaTableState,
+    snapshot: EagerSnapshot,
     /// Delta object store for handling data files
     log_store: LogStoreRef,
     /// Datafusion session state relevant for executing the input plan
-    state: Option<SessionState>,
+    session: Option<Arc<dyn Session>>,
     /// Properties passed to underlying parquet writer for when files are rewritten
     writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
@@ -124,13 +134,13 @@ impl super::Operation<()> for UpdateBuilder {
 
 impl UpdateBuilder {
     /// Create a new ['UpdateBuilder']
-    pub fn new(log_store: LogStoreRef, snapshot: DeltaTableState) -> Self {
+    pub fn new(log_store: LogStoreRef, snapshot: EagerSnapshot) -> Self {
         Self {
             predicate: None,
             updates: HashMap::new(),
             snapshot,
             log_store,
-            state: None,
+            session: None,
             writer_properties: None,
             commit_properties: CommitProperties::default(),
             safe_cast: false,
@@ -155,8 +165,8 @@ impl UpdateBuilder {
     }
 
     /// The Datafusion session state to use
-    pub fn with_session_state(mut self, state: SessionState) -> Self {
-        self.state = Some(state);
+    pub fn with_session_state(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -194,7 +204,13 @@ impl UpdateBuilder {
 }
 
 #[derive(Clone, Debug)]
-struct UpdateMetricExtensionPlanner {}
+pub(crate) struct UpdateMetricExtensionPlanner {}
+
+impl UpdateMetricExtensionPlanner {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {})
+    }
+}
 
 #[async_trait]
 impl ExtensionPlanner for UpdateMetricExtensionPlanner {
@@ -232,18 +248,19 @@ impl ExtensionPlanner for UpdateMetricExtensionPlanner {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(operation = "update", version = snapshot.version(), table_uri = %log_store.root_uri()))]
 async fn execute(
     predicate: Option<Expression>,
     updates: HashMap<Column, Expression>,
     log_store: LogStoreRef,
-    snapshot: DeltaTableState,
-    state: SessionState,
+    snapshot: EagerSnapshot,
+    session: SessionState,
     writer_properties: Option<WriterProperties>,
     mut commit_properties: CommitProperties,
     _safe_cast: bool,
     operation_id: Uuid,
     handle: Option<&Arc<dyn CustomExecuteHandler>>,
-) -> DeltaResult<(DeltaTableState, UpdateMetrics)> {
+) -> DeltaResult<(EagerSnapshot, UpdateMetrics)> {
     // Validate the predicate and update expressions.
     //
     // If the predicate is not set, then all files need to be updated.
@@ -257,7 +274,7 @@ async fn execute(
     // NOTE: The optimize_projections rule is being temporarily disabled because it errors with
     // our schemas for Lists due to issues discussed
     // [here](https://github.com/delta-io/delta-rs/pull/2886#issuecomment-2481550560>
-    let rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> = state
+    let rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>> = session
         .optimizers()
         .iter()
         .filter(|rule| {
@@ -265,16 +282,12 @@ async fn execute(
         })
         .cloned()
         .collect();
-    let state = SessionStateBuilder::from(state)
+
+    let update_planner = DeltaPlanner::new();
+
+    let session = SessionStateBuilder::from(session)
         .with_optimizer_rules(rules)
-        .build();
-
-    let update_planner = DeltaPlanner::<UpdateMetricExtensionPlanner> {
-        extension_planner: UpdateMetricExtensionPlanner {},
-    };
-
-    let state = SessionStateBuilder::new_from_existing(state)
-        .with_query_planner(Arc::new(update_planner))
+        .with_query_planner(update_planner)
         .build();
 
     let exec_start = Instant::now();
@@ -287,7 +300,7 @@ async fn execute(
     let predicate = match predicate {
         Some(predicate) => match predicate {
             Expression::DataFusion(expr) => Some(expr),
-            Expression::String(s) => Some(snapshot.parse_predicate_expression(s, &state)?),
+            Expression::String(s) => Some(snapshot.parse_predicate_expression(s, &session)?),
         },
         None => None,
     };
@@ -297,7 +310,7 @@ async fn execute(
         .map(|(key, expr)| match expr {
             Expression::DataFusion(e) => Ok((key.name, e)),
             Expression::String(s) => snapshot
-                .parse_predicate_expression(s, &state)
+                .parse_predicate_expression(s, &session)
                 .map(|e| (key.name, e)),
         })
         .collect::<Result<HashMap<String, Expr>, _>>()?;
@@ -306,7 +319,7 @@ async fn execute(
     let table_partition_cols = current_metadata.partition_columns().clone();
 
     let scan_start = Instant::now();
-    let candidates = find_files(&snapshot, log_store.clone(), &state, predicate.clone()).await?;
+    let candidates = find_files(&snapshot, log_store.clone(), &session, predicate.clone()).await?;
     metrics.scan_time_ms = Instant::now().duration_since(scan_start).as_millis() as u64;
 
     if candidates.candidates.is_empty() {
@@ -317,7 +330,7 @@ async fn execute(
 
     let scan_config = DeltaScanConfigBuilder::default()
         .with_file_column(false)
-        .with_schema(snapshot.input_schema()?)
+        .with_schema(snapshot.input_schema())
         .build(&snapshot)?;
 
     // For each rewrite evaluate the predicate and then modify each expression
@@ -330,7 +343,7 @@ async fn execute(
     let target_provider = provider_as_source(target_provider);
     let plan = LogicalPlanBuilder::scan("target", target_provider.clone(), None)?.build()?;
 
-    let df = DataFrame::new(state.clone(), plan);
+    let df = DataFrame::new(session.clone(), plan);
 
     // Take advantage of how null counts are tracked in arrow arrays use the
     // null count to track how many records do NOT satisfy the predicate.  The
@@ -350,7 +363,7 @@ async fn execute(
             enable_pushdown: false,
         }),
     });
-    let df_with_predicate_and_metrics = DataFrame::new(state.clone(), plan_with_metrics);
+    let df_with_predicate_and_metrics = DataFrame::new(session.clone(), plan_with_metrics);
 
     let expressions: Vec<Expr> = df_with_predicate_and_metrics
         .schema()
@@ -376,10 +389,11 @@ async fn execute(
         .drop_columns(&[UPDATE_PREDICATE_COLNAME])?;
     let physical_plan = updated_df.clone().create_physical_plan().await?;
     let writer_stats_config = WriterStatsConfig::new(
-        snapshot.table_config().num_indexed_cols(),
+        snapshot.table_properties().num_indexed_cols(),
         snapshot
-            .table_config()
-            .stats_columns()
+            .table_properties()
+            .data_skipping_stats_columns
+            .as_ref()
             .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
     );
 
@@ -387,11 +401,11 @@ async fn execute(
 
     let add_actions = write_execution_plan(
         Some(&snapshot),
-        state.clone(),
+        session.clone(),
         physical_plan.clone(),
         table_partition_cols.clone(),
         log_store.object_store(Some(operation_id)).clone(),
-        Some(snapshot.table_config().target_file_size() as usize),
+        Some(snapshot.table_properties().target_file_size().get() as usize),
         None,
         writer_properties.clone(),
         writer_stats_config.clone(),
@@ -449,11 +463,11 @@ async fn execute(
             Ok(df) => {
                 let cdc_actions = write_execution_plan_cdc(
                     Some(&snapshot),
-                    state,
+                    session,
                     df.create_physical_plan().await?,
                     table_partition_cols,
                     log_store.object_store(Some(operation_id)),
-                    Some(snapshot.table_config().target_file_size() as usize),
+                    Some(snapshot.table_properties().target_file_size().get() as usize),
                     None,
                     writer_properties,
                     writer_stats_config,
@@ -474,7 +488,7 @@ async fn execute(
         .build(Some(&snapshot), log_store, operation)
         .await?;
 
-    Ok((commit.snapshot(), metrics))
+    Ok((commit.snapshot().snapshot().clone(), metrics))
 }
 
 impl std::future::IntoFuture for UpdateBuilder {
@@ -484,8 +498,8 @@ impl std::future::IntoFuture for UpdateBuilder {
     fn into_future(self) -> Self::IntoFuture {
         let this = self;
         Box::pin(async move {
-            PROTOCOL.check_append_only(&this.snapshot.snapshot)?;
-            PROTOCOL.can_write_to(&this.snapshot.snapshot)?;
+            PROTOCOL.check_append_only(&this.snapshot)?;
+            PROTOCOL.can_write_to(&this.snapshot)?;
 
             if !&this.snapshot.load_config().require_files {
                 return Err(DeltaTableError::NotInitializedWithFiles("UPDATE".into()));
@@ -494,21 +508,21 @@ impl std::future::IntoFuture for UpdateBuilder {
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
-            let state = this.state.unwrap_or_else(|| {
-                let session: SessionContext = DeltaSessionContext::default().into();
-
-                // If a user provides their own their DF state then they must register the store themselves
-                register_store(this.log_store.clone(), session.runtime_env());
-
-                session.state()
-            });
+            let session = this
+                .session
+                .and_then(|session| session.as_any().downcast_ref::<SessionState>().cloned())
+                .unwrap_or_else(|| {
+                    let session: SessionContext = DeltaSessionContext::default().into();
+                    session.state()
+                });
+            register_store(this.log_store.clone(), session.runtime_env().as_ref());
 
             let (snapshot, metrics) = execute(
                 this.predicate,
                 this.updates,
                 this.log_store.clone(),
                 this.snapshot,
-                state,
+                session,
                 this.writer_properties,
                 this.commit_properties,
                 this.safe_cast,
@@ -522,7 +536,7 @@ impl std::future::IntoFuture for UpdateBuilder {
             }
 
             Ok((
-                DeltaTable::new_with_state(this.log_store, snapshot),
+                DeltaTable::new_with_state(this.log_store, DeltaTableState::new(snapshot)),
                 metrics,
             ))
         })
@@ -533,7 +547,7 @@ impl std::future::IntoFuture for UpdateBuilder {
 mod tests {
     use super::*;
 
-    use crate::kernel::{Action, PrimitiveType, Protocol, StructField, StructType};
+    use crate::kernel::{Action, PrimitiveType, StructField, StructType};
     use crate::kernel::{DataType as DeltaDataType, ProtocolInner};
     use crate::operations::load_cdf::*;
     use crate::operations::DeltaOps;
@@ -634,7 +648,7 @@ mod tests {
         use parquet::arrow::async_reader::ParquetObjectReader;
         use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
-        for pq in table.get_files_iter()? {
+        for pq in table.snapshot()?.file_paths_iter() {
             let store = table.log_store().object_store(None);
             let reader = ParquetObjectReader::new(store, pq);
             let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
@@ -673,7 +687,7 @@ mod tests {
 
         let table = write_batch(table, batch).await;
         assert_eq!(table.version(), Some(1));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
 
         let (table, metrics) = DeltaOps(table)
             .update()
@@ -682,7 +696,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.version(), Some(2));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
         assert_eq!(metrics.num_updated_rows, 4);
@@ -727,7 +741,7 @@ mod tests {
 
         let table = write_batch(table, batch).await;
         assert_eq!(table.version(), Some(1));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
 
         let (table, metrics) = DeltaOps(table)
             .update()
@@ -737,14 +751,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.version(), Some(2));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
         assert_eq!(metrics.num_updated_rows, 2);
         assert_eq!(metrics.num_copied_rows, 2);
 
-        let commit_info = table.history(None).await.unwrap();
-        let last_commit = &commit_info[0];
+        let last_commit = table.last_commit().await.unwrap();
         let parameters = last_commit.operation_parameters.clone().unwrap();
         assert_eq!(parameters["predicate"], json!("modified = '2021-02-03'"));
 
@@ -784,7 +797,7 @@ mod tests {
 
         let table = write_batch(table, batch.clone()).await;
         assert_eq!(table.version(), Some(1));
-        assert_eq!(table.get_files_count(), 2);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 2);
 
         let (table, metrics) = DeltaOps(table)
             .update()
@@ -795,7 +808,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.version(), Some(2));
-        assert_eq!(table.get_files_count(), 2);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 2);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
         assert_eq!(metrics.num_updated_rows, 2);
@@ -819,7 +832,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
         let table = write_batch(table, batch).await;
         assert_eq!(table.version(), Some(1));
-        assert_eq!(table.get_files_count(), 2);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 2);
 
         let (table, metrics) = DeltaOps(table)
             .update()
@@ -834,7 +847,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.version(), Some(2));
-        assert_eq!(table.get_files_count(), 3);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 3);
         assert_eq!(metrics.num_added_files, 2);
         assert_eq!(metrics.num_removed_files, 1);
         assert_eq!(metrics.num_updated_rows, 1);
@@ -857,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_case_sensitive() {
-        let schema = StructType::new(vec![
+        let schema = StructType::try_new(vec![
             StructField::new(
                 "Id".to_string(),
                 DeltaDataType::Primitive(PrimitiveType::String),
@@ -873,7 +886,8 @@ mod tests {
                 DeltaDataType::Primitive(PrimitiveType::String),
                 true,
             ),
-        ]);
+        ])
+        .unwrap();
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("Id", DataType::Utf8, true),
@@ -930,7 +944,7 @@ mod tests {
     async fn test_update_null() {
         let table = prepare_values_table().await;
         assert_eq!(table.version(), Some(0));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
 
         let (table, metrics) = DeltaOps(table)
             .update()
@@ -938,7 +952,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(1));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
         assert_eq!(metrics.num_updated_rows, 5);
@@ -968,14 +982,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(1));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
         assert_eq!(metrics.num_updated_rows, 2);
         assert_eq!(metrics.num_copied_rows, 3);
 
-        let commit_info = table.history(None).await.unwrap();
-        let last_commit = &commit_info[0];
+        let last_commit = table.last_commit().await.unwrap();
         let extra_info = last_commit.info.clone();
         assert_eq!(
             extra_info["operationMetrics"],
@@ -1004,7 +1017,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(1));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
         assert_eq!(metrics.num_updated_rows, 2);
@@ -1081,7 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_with_array() {
-        let schema = StructType::new(vec![
+        let schema = StructType::try_new(vec![
             StructField::new(
                 "id".to_string(),
                 DeltaDataType::Primitive(PrimitiveType::Integer),
@@ -1100,7 +1113,8 @@ mod tests {
                 ))),
                 true,
             ),
-        ]);
+        ])
+        .unwrap();
         let arrow_schema: ArrowSchema = (&schema).try_into_arrow().unwrap();
 
         // Create the first batch
@@ -1151,7 +1165,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_with_array_that_must_be_coerced() {
         let _ = pretty_env_logger::try_init();
-        let schema = StructType::new(vec![
+        let schema = StructType::try_new(vec![
             StructField::new(
                 "id".to_string(),
                 DeltaDataType::Primitive(PrimitiveType::Integer),
@@ -1170,7 +1184,8 @@ mod tests {
                 ))),
                 true,
             ),
-        ]);
+        ])
+        .unwrap();
         let arrow_schema: ArrowSchema = (&schema).try_into_arrow().unwrap();
 
         // Create the first batch
@@ -1214,7 +1229,7 @@ mod tests {
     async fn test_no_cdc_on_older_tables() {
         let table = prepare_values_table().await;
         assert_eq!(table.version(), Some(0));
-        assert_eq!(table.get_files_count(), 1);
+        assert_eq!(table.snapshot().unwrap().log_data().num_files(), 1);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -1239,19 +1254,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(2));
-
-        // NOTE: This currently doesn't really assert anything because cdc_files() is not reading
-        // actions correct
-        if let Some(state) = table.state.clone() {
-            let cdc_files = state.cdc_files();
-            assert!(cdc_files.is_ok());
-            if let Ok(cdc_files) = cdc_files {
-                let cdc_files: Vec<_> = cdc_files.collect();
-                assert_eq!(cdc_files.len(), 0);
-            }
-        } else {
-            panic!("I shouldn't exist!");
-        }
 
         // Too close for missiles, switching to guns. Just checking that the data wasn't actually
         // written instead!

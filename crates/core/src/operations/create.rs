@@ -269,7 +269,7 @@ impl CreateBuilder {
                 ensure_table_uri(self.location.clone().ok_or(CreateError::MissingLocation)?)?;
             (
                 storage_url.as_str().to_string(),
-                DeltaTableBuilder::from_uri(&storage_url)
+                DeltaTableBuilder::from_uri(storage_url)?
                     .with_storage_options(self.storage_options.clone().unwrap_or_default())
                     .build()?,
             )
@@ -303,7 +303,7 @@ impl CreateBuilder {
             })
             .unwrap_or_else(|| current_protocol);
 
-        let schema = StructType::new(self.columns);
+        let schema = StructType::try_new(self.columns)?;
 
         let protocol = protocol
             .apply_properties_to_protocol(&configuration, self.raise_if_key_not_exists)?
@@ -418,7 +418,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(0));
-        assert_eq!(table.get_schema().unwrap(), &table_schema)
+        assert_eq!(table.snapshot().unwrap().schema().as_ref(), &table_schema)
     }
 
     #[tokio::test]
@@ -429,7 +429,11 @@ mod tests {
             "./{}",
             tmp_dir.path().file_name().unwrap().to_str().unwrap()
         );
-        let table = DeltaOps::try_from_uri(relative_path)
+        let table_path = std::path::Path::new(&relative_path).canonicalize().unwrap();
+        let table_url = url::Url::from_directory_path(table_path)
+            .map_err(|_| DeltaTableError::InvalidTableLocation(relative_path.clone()))
+            .unwrap();
+        let table = DeltaOps::try_from_uri(table_url)
             .await
             .unwrap()
             .create()
@@ -438,7 +442,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(0));
-        assert_eq!(table.get_schema().unwrap(), &table_schema)
+        assert_eq!(table.snapshot().unwrap().schema().as_ref(), &table_schema)
     }
 
     #[tokio::test]
@@ -465,21 +469,22 @@ mod tests {
             .with_columns(schema.fields().cloned())
             .await
             .unwrap();
-        assert_eq!(table.version(), Some(0));
+        let snapshot = table.snapshot().unwrap();
+        assert_eq!(snapshot.version(), 0);
         assert_eq!(
-            table.protocol().unwrap().min_reader_version(),
+            snapshot.protocol().min_reader_version(),
             PROTOCOL.default_reader_version()
         );
         assert_eq!(
-            table.protocol().unwrap().min_writer_version(),
+            snapshot.protocol().min_writer_version(),
             PROTOCOL.default_writer_version()
         );
-        assert_eq!(table.get_schema().unwrap(), &schema);
+        assert_eq!(snapshot.schema().as_ref(), &schema);
 
         // check we can overwrite default settings via adding actions
         let protocol = ProtocolInner {
-            min_reader_version: 0,
-            min_writer_version: 0,
+            min_reader_version: 1,
+            min_writer_version: 2,
             writer_features: None,
             reader_features: None,
         }
@@ -490,8 +495,9 @@ mod tests {
             .with_actions(vec![Action::Protocol(protocol)])
             .await
             .unwrap();
-        assert_eq!(table.protocol().unwrap().min_reader_version(), 0);
-        assert_eq!(table.protocol().unwrap().min_writer_version(), 0);
+        let snapshot = table.snapshot().unwrap();
+        assert_eq!(snapshot.protocol().min_reader_version(), 1);
+        assert_eq!(snapshot.protocol().min_writer_version(), 2);
 
         let table = CreateBuilder::new()
             .with_location("memory:///")
@@ -500,8 +506,9 @@ mod tests {
             .await
             .unwrap();
         let append = table
-            .metadata()
+            .snapshot()
             .unwrap()
+            .metadata()
             .configuration()
             .get(TableProperty::AppendOnly.as_ref())
             .unwrap()
@@ -521,7 +528,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), Some(0));
-        let first_id = table.metadata().unwrap().id().to_string();
+        let first_id = table.snapshot().unwrap().metadata().id().to_string();
 
         let log_store = table.log_store;
 
@@ -540,7 +547,7 @@ mod tests {
             .with_save_mode(SaveMode::Ignore)
             .await
             .unwrap();
-        assert_eq!(table.metadata().unwrap().id(), first_id);
+        assert_eq!(table.snapshot().unwrap().metadata().id(), first_id);
 
         // Check table is overwritten
         let table = CreateBuilder::new()
@@ -549,7 +556,7 @@ mod tests {
             .with_save_mode(SaveMode::Overwrite)
             .await
             .unwrap();
-        assert_ne!(table.metadata().unwrap().id(), first_id)
+        assert_ne!(table.snapshot().unwrap().metadata().id(), first_id)
     }
 
     #[cfg(feature = "datafusion")]
@@ -562,8 +569,9 @@ mod tests {
             .with_save_mode(SaveMode::ErrorIfExists)
             .await
             .unwrap();
-        assert_eq!(table.version(), Some(0));
-        assert_eq!(table.get_files_count(), 1);
+        let state = table.snapshot().unwrap();
+        assert_eq!(state.version(), 0);
+        assert_eq!(state.log_data().num_files(), 1);
 
         let mut table = DeltaOps(table)
             .create()
@@ -572,9 +580,10 @@ mod tests {
             .await
             .unwrap();
         table.load().await.unwrap();
-        assert_eq!(table.version(), Some(1));
+        let state = table.snapshot().unwrap();
+        assert_eq!(state.version(), 1);
         // Checks if files got removed after overwrite
-        assert_eq!(table.get_files_count(), 0);
+        assert_eq!(state.log_data().num_files(), 0);
     }
 
     #[tokio::test]
@@ -587,8 +596,9 @@ mod tests {
             .with_save_mode(SaveMode::ErrorIfExists)
             .await
             .unwrap();
-        assert_eq!(table.version(), Some(0));
-        assert_eq!(table.get_files_count(), 1);
+        let state = table.snapshot().unwrap();
+        assert_eq!(state.version(), 0);
+        assert_eq!(state.log_data().num_files(), 1);
 
         let mut table = DeltaOps(table)
             .create()
@@ -598,9 +608,10 @@ mod tests {
             .await
             .unwrap();
         table.load().await.unwrap();
-        assert_eq!(table.version(), Some(1));
+        let state = table.snapshot().unwrap();
+        assert_eq!(state.version(), 1);
         // Checks if files got removed after overwrite
-        assert_eq!(table.get_files_count(), 0);
+        assert_eq!(state.log_data().num_files(), 0);
     }
 
     #[tokio::test]
@@ -631,8 +642,9 @@ mod tests {
         // Ensure the non-Delta key was set correctly
         let value = table
             .unwrap()
-            .metadata()
+            .snapshot()
             .unwrap()
+            .metadata()
             .configuration()
             .get("key")
             .unwrap()

@@ -13,7 +13,7 @@ jobs:
     name: Validate git tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: compare git tag with cargo metadata
         run: |
@@ -30,13 +30,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
           override: true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: cargo publish
         uses: actions-rs/cargo@v1

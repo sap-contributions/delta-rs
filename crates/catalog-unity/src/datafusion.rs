@@ -19,7 +19,7 @@ use super::models::{
     TableTempCredentialsResponse, TemporaryTableCredentials,
 };
 use super::{DataCatalogResult, UnityCatalog, UnityCatalogError};
-use deltalake_core::DeltaTableBuilder;
+use deltalake_core::{ensure_table_uri, DeltaTableBuilder};
 
 /// In-memory list of catalogs populated by unity catalog
 #[derive(Debug)]
@@ -183,14 +183,22 @@ impl UnitySchemaProvider {
         table: &str,
     ) -> Result<TemporaryTableCredentials, UnityCatalogError> {
         tracing::debug!("Fetching new credential for: {catalog}.{schema}.{table}",);
-        self.client
-            .get_temp_table_credentials(catalog, schema, table)
-            .map(|resp| match resp {
-                Ok(TableTempCredentialsResponse::Success(temp_creds)) => Ok(temp_creds),
-                Ok(TableTempCredentialsResponse::Error(err)) => Err(err.into()),
-                Err(err) => Err(err),
-            })
+        match self
+            .client
+            .get_temp_table_credentials_with_permission(catalog, schema, table, "READ_WRITE")
             .await
+        {
+            Ok(TableTempCredentialsResponse::Success(temp_creds)) => Ok(temp_creds),
+            Ok(TableTempCredentialsResponse::Error(_err)) => match self
+                .client
+                .get_temp_table_credentials(catalog, schema, table)
+                .await?
+            {
+                TableTempCredentialsResponse::Success(temp_creds) => Ok(temp_creds),
+                _ => Err(UnityCatalogError::TemporaryCredentialsFetchFailure),
+            },
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -228,7 +236,10 @@ impl SchemaProvider for UnitySchemaProvider {
                 let new_storage_opts = temp_creds.get_credentials().ok_or_else(|| {
                     DataFusionError::External(UnityCatalogError::MissingCredential.into())
                 })?;
-                let table = DeltaTableBuilder::from_uri(table.storage_location)
+                let table_url = ensure_table_uri(&table.storage_location)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let table = DeltaTableBuilder::from_uri(table_url)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
                     .with_storage_options(new_storage_opts)
                     .load()
                     .await?;

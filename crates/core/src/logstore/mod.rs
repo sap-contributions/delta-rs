@@ -48,7 +48,6 @@
 //! ## Configuration
 //!
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Cursor};
 use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
@@ -68,9 +67,10 @@ use regex::Regex;
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
+use serde_json::Deserializer;
 use tokio::runtime::RuntimeFlavor;
 use tokio::task::spawn_blocking;
-use tracing::{debug, error};
+use tracing::*;
 use url::Url;
 use uuid::Uuid;
 
@@ -160,6 +160,9 @@ pub fn default_logstore(
 pub type LogStoreRef = Arc<dyn LogStore>;
 
 static DELTA_LOG_PATH: LazyLock<Path> = LazyLock::new(|| Path::from("_delta_log"));
+
+pub(crate) static DELTA_LOG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d{20})\.(json|checkpoint(\.\d+)?\.parquet)$").unwrap());
 
 /// Return the [LogStoreRef] for the provided [Url] location
 ///
@@ -306,7 +309,7 @@ pub trait LogStore: Send + Sync + AsAny {
             Err(err) => Err(err),
         }?;
 
-        let actions = crate::logstore::get_actions(next_version, commit_log_bytes).await;
+        let actions = crate::logstore::get_actions(next_version, &commit_log_bytes).await;
         Ok(PeekCommit::New(next_version, actions?))
     }
 
@@ -315,9 +318,9 @@ pub trait LogStore: Send + Sync + AsAny {
 
     fn root_object_store(&self, operation_id: Option<Uuid>) -> Arc<dyn ObjectStore>;
 
-    async fn engine(&self, operation_id: Option<Uuid>) -> Arc<dyn Engine> {
+    fn engine(&self, operation_id: Option<Uuid>) -> Arc<dyn Engine> {
         let store = self.root_object_store(operation_id);
-        get_engine(store).await
+        get_engine(store)
     }
 
     /// [Path] to Delta log
@@ -338,7 +341,7 @@ pub trait LogStore: Send + Sync + AsAny {
 
     #[deprecated(
         since = "0.1.0",
-        note = "DO NOT USE: Just a stop grap to support lakefs during kernel migration"
+        note = "DO NOT USE: Just a stop gap to support lakefs during kernel migration"
     )]
     fn transaction_url(&self, _operation_id: Uuid, base: &Url) -> DeltaResult<Url> {
         Ok(base.clone())
@@ -464,8 +467,8 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
         T::root_object_store(self, operation_id)
     }
 
-    async fn engine(&self, operation_id: Option<Uuid>) -> Arc<dyn Engine> {
-        T::engine(self, operation_id).await
+    fn engine(&self, operation_id: Option<Uuid>) -> Arc<dyn Engine> {
+        T::engine(self, operation_id)
     }
 
     fn to_uri(&self, location: &Path) -> String {
@@ -494,7 +497,7 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
     }
 }
 
-async fn get_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
+pub(crate) fn get_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
     let handle = tokio::runtime::Handle::current();
     match handle.runtime_flavor() {
         RuntimeFlavor::MultiThread => Arc::new(DefaultEngine::new(
@@ -525,7 +528,6 @@ fn object_store_url(location: &Url) -> ObjectStoreUrl {
 // TODO: find out why this is necessary
 pub(crate) fn object_store_path(table_root: &Url) -> DeltaResult<Path> {
     Ok(match ObjectStoreScheme::parse(table_root) {
-        Ok((ObjectStoreScheme::AmazonS3, _)) => Path::parse(table_root.path())?,
         Ok((_, path)) => path,
         _ => Path::parse(table_root.path())?,
     })
@@ -564,23 +566,22 @@ pub fn to_uri(root: &Url, location: &Path) -> String {
 /// Reads a commit and gets list of actions
 pub async fn get_actions(
     version: i64,
-    commit_log_bytes: bytes::Bytes,
+    commit_log_bytes: &bytes::Bytes,
 ) -> Result<Vec<Action>, DeltaTableError> {
     debug!("parsing commit with version {version}...");
-    let reader = BufReader::new(Cursor::new(commit_log_bytes));
-
-    let mut actions = Vec::new();
-    for re_line in reader.lines() {
-        let line = re_line?;
-        let lstr = line.as_str();
-        let action = serde_json::from_str(lstr).map_err(|e| DeltaTableError::InvalidJsonLog {
-            json_err: e,
-            line,
-            version,
-        })?;
-        actions.push(action);
-    }
-    Ok(actions)
+    Deserializer::from_slice(commit_log_bytes)
+        .into_iter::<Action>()
+        .map(|result| {
+            result.map_err(|e| {
+                let line = format!("Error at line {}, column {}", e.line(), e.column());
+                DeltaTableError::InvalidJsonLog {
+                    json_err: e,
+                    line,
+                    version,
+                }
+            })
+        })
+        .collect()
 }
 
 // TODO: maybe a bit of a hack, required to `#[derive(Debug)]` for the operation builders
@@ -638,9 +639,6 @@ impl<'de> Deserialize<'de> for LogStoreConfig {
     }
 }
 
-static DELTA_LOG_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d{20})\.(json|checkpoint(\.\d+)?\.parquet)$").unwrap());
-
 /// Extract version from a file name in the delta log
 pub fn extract_version_from_filename(name: &str) -> Option<i64> {
     DELTA_LOG_REGEX
@@ -659,7 +657,7 @@ pub async fn get_latest_version(
         current_version
     };
 
-    let storage = log_store.engine(None).await.storage_handler();
+    let storage = log_store.engine(None).storage_handler();
     let log_root = log_store.log_root_url();
 
     let segment = spawn_blocking(move || {
@@ -681,19 +679,31 @@ pub async fn get_latest_version(
 }
 
 /// Read delta log for a specific version
+#[instrument(skip(storage), fields(version = version, path = %commit_uri_from_version(version)))]
 pub async fn read_commit_entry(
     storage: &dyn ObjectStore,
     version: i64,
 ) -> DeltaResult<Option<Bytes>> {
     let commit_uri = commit_uri_from_version(version);
     match storage.get(&commit_uri).await {
-        Ok(res) => Ok(Some(res.bytes().await?)),
-        Err(ObjectStoreError::NotFound { .. }) => Ok(None),
-        Err(err) => Err(err.into()),
+        Ok(res) => {
+            let bytes = res.bytes().await?;
+            debug!(size = bytes.len(), "commit entry read successfully");
+            Ok(Some(bytes))
+        }
+        Err(ObjectStoreError::NotFound { .. }) => {
+            debug!("commit entry not found");
+            Ok(None)
+        }
+        Err(err) => {
+            error!(error = %err, version = version, "failed to read commit entry");
+            Err(err.into())
+        }
     }
 }
 
 /// Default implementation for writing a commit entry
+#[instrument(skip(storage), fields(version = version, tmp_path = %tmp_commit, commit_path = %commit_uri_from_version(version)))]
 pub async fn write_commit_entry(
     storage: &dyn ObjectStore,
     version: i64,
@@ -707,21 +717,28 @@ pub async fn write_commit_entry(
         .map_err(|err| -> TransactionError {
             match err {
                 ObjectStoreError::AlreadyExists { .. } => {
+                    warn!("commit entry already exists");
                     TransactionError::VersionAlreadyExists(version)
                 }
-                _ => TransactionError::from(err),
+                _ => {
+                    error!(error = %err, "failed to write commit entry");
+                    TransactionError::from(err)
+                }
             }
         })?;
+    debug!("commit entry written successfully");
     Ok(())
 }
 
 /// Default implementation for aborting a commit entry
+#[instrument(skip(storage), fields(version = _version, tmp_path = %tmp_commit))]
 pub async fn abort_commit_entry(
     storage: &dyn ObjectStore,
     _version: i64,
     tmp_commit: &Path,
 ) -> Result<(), TransactionError> {
     storage.delete_with_retries(tmp_commit, 15).await?;
+    debug!("commit entry aborted successfully");
     Ok(())
 }
 
@@ -946,7 +963,7 @@ pub(crate) mod tests {
     }
 
     /// Collect list stream
-    pub async fn flatten_list_stream(
+    pub(crate) async fn flatten_list_stream(
         storage: &object_store::DynObjectStore,
         prefix: Option<&Path>,
     ) -> object_store::Result<Vec<Path>> {
@@ -980,6 +997,29 @@ mod datafusion_tests {
                 object_store_url(&url_1).as_str(),
                 object_store_url(&url_2).as_str(),
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_actions_malformed_json() {
+        let malformed_json = bytes::Bytes::from(
+            r#"{"add": {"path": "test.parquet", "partitionValues": {}, "size": 100, "modificationTime": 1234567890, "dataChange": true}}
+{"invalid json without closing brace"#,
+        );
+
+        let result = get_actions(0, &malformed_json).await;
+
+        match result {
+            Err(DeltaTableError::InvalidJsonLog {
+                line,
+                version,
+                json_err,
+            }) => {
+                assert_eq!(version, 0);
+                assert!(line.contains("line 2"));
+                assert!(json_err.is_eof());
+            }
+            other => panic!("Expected InvalidJsonLog error, got {:?}", other),
         }
     }
 }

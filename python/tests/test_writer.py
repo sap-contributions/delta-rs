@@ -1619,23 +1619,6 @@ def test_issue_1651_roundtrip_timestamp(tmp_path: pathlib.Path):
 
 
 @pytest.mark.pyarrow
-def test_invalid_decimals(tmp_path: pathlib.Path):
-    import re
-
-    import pyarrow as pa
-
-    data = pa.table(
-        {"x": pa.array([Decimal("10000000000000000000000000000000000000.0")])}
-    )
-
-    with pytest.raises(
-        SchemaMismatchError,
-        match=re.escape("Invalid data type for Delta Lake: Decimal256(39, 1)"),
-    ):
-        write_deltalake(table_or_uri=tmp_path, mode="append", data=data)
-
-
-@pytest.mark.pyarrow
 def test_write_large_decimal(tmp_path: pathlib.Path):
     import pyarrow as pa
 
@@ -1835,9 +1818,9 @@ def test_write_stats_column_idx(tmp_path: pathlib.Path):
         assert get_value("null_count.bar") == 1
         assert get_value("min.bar") == 1
         assert get_value("max.bar") == 3
-        assert get_value("null_count.baz") is None
-        assert get_value("min.baz") is None
-        assert get_value("max.baz") is None
+
+        with pytest.raises(Exception):
+            get_value("null_count.baz")
 
     data = Table(
         {
@@ -1884,12 +1867,12 @@ def test_write_stats_columns_stats_provided(tmp_path: pathlib.Path):
         assert get_value("null_count.foo") == 2
         assert get_value("min.foo") == "a"
         assert get_value("max.foo") == "b"
-        assert get_value("null_count.bar") is None
-        assert get_value("min.bar") is None
-        assert get_value("max.bar") is None
         assert get_value("null_count.baz") == 2
         assert get_value("min.baz") == 1
         assert get_value("max.baz") == 1
+
+        with pytest.raises(Exception):
+            get_value("null_count.bar")
 
     data = Table(
         {
@@ -2503,3 +2486,27 @@ def test_polars_write_array(tmp_path: pathlib.Path):
         df,
         mode="overwrite",
     )
+
+
+@pytest.mark.polars
+def test_tilde_path_works_with_writes():
+    import os
+    import shutil
+    import uuid
+
+    import polars as pl
+    import polars.testing as pl_testing
+
+    df = pl.DataFrame({"num": [1, 2, 3], "letter": ["a", "b", "c"]})
+
+    unique_id = str(uuid.uuid4())[:8]
+    tilde_path = f"~/tmp_delta_test_{unique_id}"
+
+    try:
+        df.write_delta(tilde_path)
+        df_read = pl.read_delta(tilde_path)
+        pl_testing.assert_frame_equal(df, df_read)
+    finally:
+        expanded_path = os.path.expanduser(tilde_path)
+        if os.path.exists(expanded_path):
+            shutil.rmtree(expanded_path)

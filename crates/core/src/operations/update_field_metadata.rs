@@ -9,17 +9,16 @@ use itertools::Itertools;
 
 use super::{CustomExecuteHandler, Operation};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::{MetadataExt as _, ProtocolExt as _};
+use crate::kernel::{EagerSnapshot, MetadataExt as _, ProtocolExt as _};
 use crate::logstore::LogStoreRef;
 use crate::protocol::DeltaOperation;
-use crate::table::state::DeltaTableState;
 use crate::DeltaTable;
 use crate::{DeltaResult, DeltaTableError};
 
 /// Update a field's metadata in a schema. If the key does not exists, the entry is inserted.
 pub struct UpdateFieldMetadataBuilder {
     /// A snapshot of the table's state
-    snapshot: DeltaTableState,
+    snapshot: EagerSnapshot,
     /// The name of the field where the metadata may be updated
     field_name: String,
     /// HashMap of the metadata to upsert
@@ -42,7 +41,7 @@ impl super::Operation<()> for UpdateFieldMetadataBuilder {
 
 impl UpdateFieldMetadataBuilder {
     /// Create a new builder
-    pub fn new(log_store: LogStoreRef, snapshot: DeltaTableState) -> Self {
+    pub fn new(log_store: LogStoreRef, snapshot: EagerSnapshot) -> Self {
         Self {
             metadata: HashMap::new(),
             field_name: String::new(),
@@ -92,14 +91,14 @@ impl std::future::IntoFuture for UpdateFieldMetadataBuilder {
 
             let table_schema = this.snapshot.schema();
 
-            let mut fields = table_schema.fields.clone();
             // Check if the field exists in the schema. Otherwise, no need to continue the
             // operation
-            let Some(field) = fields.get_mut(&this.field_name) else {
+            let Some(field) = table_schema.field(&this.field_name) else {
                 return Err(DeltaTableError::Generic(
                     "No field with the provided name in the schema".to_string(),
                 ));
             };
+            let mut field = field.clone();
 
             // DO NOT MODIFY PROTECTED METADATA.
             // Since `delta_kernel::schema::ColumnMetadataKey` does not `impl` any parsing (e.g. `std::core::From``) - at the time of implementation -
@@ -125,7 +124,15 @@ impl std::future::IntoFuture for UpdateFieldMetadataBuilder {
                     .or_insert(value);
             });
 
-            let updated_table_schema = StructType::new(fields.into_values());
+            // This feels a little silly but I could not find a better way to modify the StructType
+            // "in place" as of delta-kernel-rs 0.16.0
+            let updated_table_schema = StructType::try_new(table_schema.fields().map(|f| {
+                match f.name == field.name {
+                    // return our modified field instead
+                    true => field.clone(),
+                    false => f.clone(),
+                }
+            }))?;
 
             let mut metadata = this.snapshot.metadata().clone();
 

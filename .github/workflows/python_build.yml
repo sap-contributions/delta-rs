@@ -5,26 +5,21 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, next, next/*]
 
 defaults:
   run:
     working-directory: ./python
 
 env:
-  RUSTFLAGS: "-C debuginfo=line-tables-only"
-  CARGO_INCREMENTAL: 0
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   test-minimal:
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
-      - uses: actions/checkout@v4
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/checkout@v5
 
       - name: Setup Environment
         uses: ./.github/actions/setup-env
@@ -35,9 +30,6 @@ jobs:
         run: |
           uv sync --no-install-project
           make check-python
-
-      - name: Check Rust
-        run: make check-rust
 
       - name: Build and install deltalake
         run: |
@@ -51,14 +43,8 @@ jobs:
   test:
     name: Python Build (Python 3.10 PyArrow latest)
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
-
     steps:
-      - uses: actions/checkout@v4
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: actions/checkout@v5
 
       - name: Setup Environment
         uses: ./.github/actions/setup-env
@@ -87,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Environment
         uses: ./.github/actions/setup-env
@@ -106,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Environment
         uses: ./.github/actions/setup-env
@@ -129,7 +115,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Environment
         uses: ./.github/actions/setup-env
@@ -152,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Environment
         uses: ./.github/actions/setup-env
@@ -171,16 +157,13 @@ jobs:
   multi-python-running:
     name: Running with Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C debuginfo=line-tables-only"
-      CARGO_INCREMENTAL: 0
 
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Environment
         uses: ./.github/actions/setup-env

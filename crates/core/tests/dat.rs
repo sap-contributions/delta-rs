@@ -26,16 +26,17 @@ fn reader_test_eager(path: &Path) -> datatest_stable::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(async {
+        .block_on(async move {
             let case = read_dat_case(root_dir).unwrap();
 
             let table = DeltaTableBuilder::from_uri(case.table_root().unwrap())
+                .unwrap()
                 .load()
                 .await
                 .expect("table");
             let table_info = case.table_summary().expect("load summary");
             let snapshot = table.snapshot().expect("Failed to load snapshot");
-            let protocol = table.protocol().expect("Failed to load protocol");
+            let protocol = snapshot.protocol();
             assert_eq!(snapshot.version() as u64, table_info.version);
             assert_eq!(
                 (protocol.min_reader_version(), protocol.min_writer_version()),
@@ -45,8 +46,6 @@ fn reader_test_eager(path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
-datatest_stable::harness!(
-    reader_test_eager,
-    "../../dat/v0.0.3/reader_tests/generated/",
-    r"test_case_info\.json"
-);
+datatest_stable::harness! {
+    { test = reader_test_eager, root = "../../dat/v0.0.3/reader_tests/generated/", pattern = r"test_case_info\.json" },
+}

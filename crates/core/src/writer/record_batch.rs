@@ -15,6 +15,7 @@ use arrow_select::take::take;
 use bytes::Bytes;
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
 use delta_kernel::expressions::Scalar;
+use delta_kernel::table_properties::DataSkippingNumIndexedCols;
 use indexmap::IndexMap;
 use object_store::{path::Path, ObjectStore};
 use parquet::{arrow::ArrowWriter, errors::ParquetError};
@@ -30,7 +31,7 @@ use super::utils::{
 use super::{DeltaWriter, DeltaWriterError, WriteMode};
 use crate::errors::DeltaTableError;
 use crate::kernel::schema::merge_arrow_schema;
-use crate::kernel::MetadataExt;
+use crate::kernel::MetadataExt as _;
 use crate::kernel::{scalars::ScalarExt, Action, Add, PartitionsExt};
 use crate::logstore::ObjectStoreRetryExt;
 use crate::table::builder::DeltaTableBuilder;
@@ -46,7 +47,7 @@ pub struct RecordBatchWriter {
     should_evolve: bool,
     partition_columns: Vec<String>,
     arrow_writers: HashMap<String, PartitionWriter>,
-    num_indexed_cols: i32,
+    num_indexed_cols: DataSkippingNumIndexedCols,
     stats_columns: Option<Vec<String>>,
 }
 
@@ -64,7 +65,9 @@ impl RecordBatchWriter {
         partition_columns: Option<Vec<String>>,
         storage_options: Option<HashMap<String, String>>,
     ) -> Result<Self, DeltaTableError> {
-        let delta_table = DeltaTableBuilder::from_uri(table_uri)
+        let table_url = url::Url::parse(table_uri.as_ref())
+            .map_err(|e| DeltaTableError::InvalidTableLocation(e.to_string()))?;
+        let delta_table = DeltaTableBuilder::from_uri(table_url)?
             .with_storage_options(storage_options.unwrap_or_default())
             .build()?;
         // Initialize writer properties for the underlying arrow writer
@@ -74,9 +77,9 @@ impl RecordBatchWriter {
             .build();
 
         // if metadata fails to load, use an empty hashmap and default values for num_indexed_cols and stats_columns
-        let configuration = delta_table.metadata().map_or_else(
+        let configuration = delta_table.snapshot().map_or_else(
             |_| HashMap::new(),
-            |metadata| metadata.configuration().clone(),
+            |snapshot| snapshot.metadata().configuration().clone(),
         );
 
         Ok(Self {
@@ -89,8 +92,14 @@ impl RecordBatchWriter {
             arrow_writers: HashMap::new(),
             num_indexed_cols: configuration
                 .get("delta.dataSkippingNumIndexedCols")
-                .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(DEFAULT_NUM_INDEX_COLS),
+                .and_then(|v| {
+                    v.parse::<u64>()
+                        .ok()
+                        .map(DataSkippingNumIndexedCols::NumColumns)
+                })
+                .unwrap_or(DataSkippingNumIndexedCols::NumColumns(
+                    DEFAULT_NUM_INDEX_COLS,
+                )),
             stats_columns: configuration
                 .get("delta.dataSkippingStatsColumns")
                 .map(|v| v.split(',').map(|s| s.to_string()).collect()),
@@ -100,7 +109,7 @@ impl RecordBatchWriter {
     /// Creates a [`RecordBatchWriter`] to write data to provided Delta Table
     pub fn for_table(table: &DeltaTable) -> Result<Self, DeltaTableError> {
         // Initialize an arrow schema ref from the delta table schema
-        let metadata = table.metadata()?;
+        let metadata = table.snapshot()?.metadata();
         let arrow_schema: ArrowSchema = (&metadata.parse_schema()?).try_into_arrow()?;
         let arrow_schema_ref = Arc::new(arrow_schema);
         let partition_columns = metadata.partition_columns().clone();
@@ -110,7 +119,7 @@ impl RecordBatchWriter {
             // NOTE: Consider extracting config for writer properties and setting more than just compression
             .set_compression(Compression::SNAPPY)
             .build();
-        let configuration = table.metadata()?.configuration().clone();
+        let configuration = table.snapshot()?.metadata().configuration().clone();
 
         Ok(Self {
             storage: table.object_store(),
@@ -122,8 +131,14 @@ impl RecordBatchWriter {
             arrow_writers: HashMap::new(),
             num_indexed_cols: configuration
                 .get("delta.dataSkippingNumIndexedCols")
-                .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(DEFAULT_NUM_INDEX_COLS),
+                .and_then(|v| {
+                    v.parse::<u64>()
+                        .ok()
+                        .map(DataSkippingNumIndexedCols::NumColumns)
+                })
+                .unwrap_or(DataSkippingNumIndexedCols::NumColumns(
+                    DEFAULT_NUM_INDEX_COLS,
+                )),
             stats_columns: configuration
                 .get("delta.dataSkippingStatsColumns")
                 .map(|v| v.split(',').map(|s| s.to_string()).collect()),
@@ -162,8 +177,6 @@ impl RecordBatchWriter {
         partition_values: &IndexMap<String, Scalar>,
         mode: WriteMode,
     ) -> Result<ArrowSchemaRef, DeltaTableError> {
-        let arrow_schema =
-            arrow_schema_without_partitions(&self.arrow_schema_ref, &self.partition_columns);
         let partition_key = partition_values.hive_partition_path();
 
         let record_batch = record_batch_without_partitions(&record_batch, &self.partition_columns)?;
@@ -172,16 +185,26 @@ impl RecordBatchWriter {
             Some(writer) => writer.write(&record_batch, mode)?,
             None => {
                 let mut writer = PartitionWriter::new(
-                    arrow_schema,
+                    arrow_schema_without_partitions(
+                        &self.arrow_schema_ref,
+                        &self.partition_columns,
+                    ),
                     partition_values.clone(),
                     self.writer_properties.clone(),
                 )?;
                 let schema = writer.write(&record_batch, mode)?;
+                // Currently schema evolution is not supported with partition columns which means
+                // the schema returned here is equivalent to `arrow_schema_without_partitions`
+                // which can cause problems see #3783
                 let _ = self.arrow_writers.insert(partition_key, writer);
                 schema
             }
         };
-        Ok(written_schema)
+        if mode == WriteMode::MergeSchema {
+            Ok(written_schema)
+        } else {
+            Ok(self.arrow_schema_ref.clone())
+        }
     }
 
     /// Sets the writer properties for the underlying arrow writer.
@@ -226,10 +249,10 @@ impl DeltaWriter<RecordBatch> for RecordBatchWriter {
         self.should_evolve = mode == WriteMode::MergeSchema;
 
         for result in self.divide_by_partition_values(&values)? {
-            let schema = self
+            let maybe_evolved_schema = self
                 .write_partition(result.record_batch, &result.partition_values, mode)
                 .await?;
-            self.arrow_schema_ref = schema;
+            self.arrow_schema_ref = maybe_evolved_schema;
         }
         Ok(())
     }
@@ -279,7 +302,7 @@ impl DeltaWriter<RecordBatch> for RecordBatchWriter {
             // TODO: we are using the metadata from the passed table, but actually have no guarantee that this is
             // the same table that was used to create the writer instance. Previously we were erasing current config
             // assigning a new table ID, which we should not be doing when evolving the schema.
-            let current_meta = table.metadata()?.clone();
+            let current_meta = table.snapshot()?.metadata().clone();
             let metadata = current_meta.with_schema(&schema)?;
             adds.push(Action::Metadata(metadata));
         }
@@ -493,6 +516,7 @@ mod tests {
     use super::*;
     use crate::operations::create::CreateBuilder;
     use crate::writer::test_utils::*;
+    use crate::{DeltaOps, DeltaResult};
     use arrow::json::ReaderBuilder;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -557,8 +581,6 @@ mod tests {
      */
     #[tokio::test]
     async fn test_divide_record_batch_with_map_single_partition() {
-        use crate::DeltaOps;
-
         let table = crate::writer::test_utils::create_bare_table();
         let partition_cols = ["modified".to_string()];
         let delta_schema = r#"
@@ -616,6 +638,61 @@ mod tests {
             let partition_key = result.partition_values.hive_partition_path();
             assert!(expected_keys.contains(&partition_key));
         }
+    }
+
+    /// This test reproduces an issue where the [RecordBatchWriter] can have its schema "reordered"
+    /// by differently ordered JSON objects that were deserialized and written by arrow's [Decoder]
+    #[tokio::test]
+    async fn test_writer_schema_mutation() -> DeltaResult<()> {
+        let delta_schema = r#"
+        {"type" : "struct",
+        "fields" : [
+            {"name" : "id", "type" : "string", "nullable" : false, "metadata" : {}},
+            {"name" : "value", "type" : "integer", "nullable" : false, "metadata" : {}},
+            {"name" : "modified", "type" : "string", "nullable" : false, "metadata" : {}},
+            {"name" : "metadata", "type" :
+                {"type" : "map", "keyType" : "string", "valueType" : "string", "valueContainsNull" : true},
+                "nullable" : false, "metadata" : {}}
+            ]
+        }"#;
+
+        let delta_schema: StructType =
+            serde_json::from_str(delta_schema).expect("Failed to parse schema");
+
+        let mut table = DeltaOps::new_in_memory()
+            .create()
+            .with_columns(delta_schema.fields().cloned())
+            .with_partition_columns(vec!["modified"])
+            .await
+            .unwrap();
+        let mut writer = RecordBatchWriter::for_table(&table).unwrap();
+        let original_schema = writer.arrow_schema().clone();
+
+        for data in &[
+            r#"{"id" : "0xdeadbeef", "value" : 1, "modified" : "2021-02-01",
+                "metadata" : {"some-key" : "some-value"}}"#,
+        ] {
+            let data = data.as_bytes();
+
+            // Using a batch size of two since the buf above only has two records
+            let mut decoder = ReaderBuilder::new(writer.arrow_schema())
+                .with_batch_size(1)
+                .build_decoder()
+                .expect("Failed to build decoder");
+
+            decoder
+                .decode(data)
+                .expect("Failed to deserialize the JSON in the buffer");
+
+            if let Some(batch) = decoder.flush().unwrap() {
+                pretty_assertions::assert_eq!(batch.schema(), original_schema);
+                writer.write(batch).await?;
+            }
+
+            pretty_assertions::assert_eq!(writer.arrow_schema(), original_schema)
+        }
+        writer.flush_and_commit(&mut table).await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -826,7 +903,7 @@ mod tests {
             table.load().await.expect("Failed to load table");
             assert_eq!(table.version(), Some(2));
 
-            let new_schema = table.metadata().unwrap().parse_schema().unwrap();
+            let new_schema = table.snapshot().unwrap().metadata().parse_schema().unwrap();
             let expected_columns = vec!["id", "value", "modified", "vid", "name"];
             let found_columns: Vec<&String> = new_schema.fields().map(|f| f.name()).collect();
             assert_eq!(
@@ -954,7 +1031,7 @@ mod tests {
                 DataType as DeltaDataType, PrimitiveType, StructField, StructType,
             };
 
-            let table_schema = StructType::new(vec![
+            let table_schema = StructType::try_new(vec![
                 StructField::new(
                     "id".to_string(),
                     DeltaDataType::Primitive(PrimitiveType::String),
@@ -970,7 +1047,8 @@ mod tests {
                     DeltaDataType::Primitive(PrimitiveType::String),
                     true,
                 ),
-            ]);
+            ])
+            .unwrap();
             let table_dir = tempfile::tempdir().unwrap();
             let table_path = table_dir.path();
 
@@ -1064,7 +1142,12 @@ mod tests {
         writer.write(batch).await.unwrap();
         writer.flush_and_commit(&mut table).await.unwrap();
         assert_eq!(table.version(), Some(1));
-        let add_actions = table.state.unwrap().file_actions().unwrap();
+        let add_actions = table
+            .state
+            .unwrap()
+            .file_actions(&table.log_store)
+            .await
+            .unwrap();
         assert_eq!(add_actions.len(), 1);
         let expected_stats ="{\"numRecords\":11,\"minValues\":{\"value\":1,\"id\":\"A\"},\"maxValues\":{\"id\":\"B\",\"value\":11},\"nullCount\":{\"id\":0,\"value\":0}}";
         assert_eq!(
@@ -1113,7 +1196,12 @@ mod tests {
         writer.write(batch).await.unwrap();
         writer.flush_and_commit(&mut table).await.unwrap();
         assert_eq!(table.version(), Some(1));
-        let add_actions = table.state.unwrap().file_actions().unwrap();
+        let add_actions = table
+            .state
+            .unwrap()
+            .file_actions(&table.log_store)
+            .await
+            .unwrap();
         assert_eq!(add_actions.len(), 1);
         let expected_stats = "{\"numRecords\":11,\"minValues\":{\"id\":\"A\"},\"maxValues\":{\"id\":\"B\"},\"nullCount\":{\"id\":0}}";
         assert_eq!(
