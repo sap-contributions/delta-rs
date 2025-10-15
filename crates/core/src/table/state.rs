@@ -313,6 +313,13 @@ impl EagerSnapshot {
             .map(|file| evaluator.evaluate_arrow(file.clone()))
             .collect::<Result<Vec<_>, _>>()?;
 
+        //check if results is empty
+        if results.is_empty() {
+            return Err(DeltaTableError::SchemaMismatch {
+                msg: "no record batches produced".to_string(),
+            });
+        }
+
         let result = concat_batches(results[0].schema_ref(), &results)?;
 
         if flatten {

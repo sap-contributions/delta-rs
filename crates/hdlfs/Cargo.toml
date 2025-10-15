@@ -44,4 +44,4 @@ integration_test = []
 
 [patch.crates-io]
 object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store.git", branch = "hdlfs"}
-
+#object_store = { path = "/usr/local/simon/o-opensource/opensource-arrow-rs-object-store" }
