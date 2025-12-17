@@ -60,7 +60,7 @@ impl ListingSchemaProvider {
 
     /// Reload table information from ObjectStore
     pub async fn refresh(&self) -> datafusion::common::Result<()> {
-        let entries: Vec<_> = self.store.list(None).try_collect().await.unwrap();
+        let entries: Vec<_> = self.store.list(None).try_collect().await?;
         let mut tables = HashSet::new();
         for file in entries.iter() {
             let mut parent = Path::new(file.location.as_ref());
