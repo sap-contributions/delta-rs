@@ -6,7 +6,7 @@ use chrono::TimeZone;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::listing::PartitionedFile;
 use object_store::path::Path;
-use object_store::ObjectMeta;
+use object_store::ObjectMeta as ObjMeta;
 use serde_json::Value;
 
 use crate::delta_datafusion::cdf::CHANGE_TYPE_COL;
@@ -73,7 +73,7 @@ pub fn create_partition_values<F: FileAction>(
             new_part_values.extend(partition_values);
 
             let part = PartitionedFile {
-                object_meta: ObjectMeta {
+                object_meta: ObjMeta {
                     location: Path::parse(action.path().as_str())?,
                     size: action.size()? as u64,
                     e_tag: None,

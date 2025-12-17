@@ -29,7 +29,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 deltalake-core = { version = "0.29.0", path = "../core", features = [
-    "datafusion",
+  "datafusion",
 ] }
 chrono = { workspace = true }
 serial_test = "3"
@@ -43,5 +43,6 @@ integration_test = []
 
 
 [patch.crates-io]
-object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store.git", branch = "hdlfs-120"}
+object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store.git", branch = "hdlfs-121" }
+# object_store = { path = "../arrow-rs-object-store" }
 #object_store = { path = "/usr/local/simon/o-opensource/opensource-arrow-rs-object-store" }
