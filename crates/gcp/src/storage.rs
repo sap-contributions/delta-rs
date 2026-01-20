@@ -1,8 +1,8 @@
 //! GCP GCS storage backend.
 
 use bytes::Bytes;
-use deltalake_core::logstore::ObjectStoreRef;
 use deltalake_core::Path;
+use deltalake_core::logstore::ObjectStoreRef;
 use futures::stream::BoxStream;
 use object_store::{MultipartUpload, PutMultipartOptions, PutPayload};
 use std::ops::Range;
@@ -131,4 +131,11 @@ impl ObjectStore for GcsStorageBackend {
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, options).await
     }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_it() {}
 }

@@ -5,16 +5,18 @@
 
 use crate::errors::LockClientError;
 use crate::storage::S3StorageOptions;
-use crate::{constants, CommitEntry, DynamoDbLockClient, UpdateLogEntryResult};
+use crate::{CommitEntry, DynamoDbLockClient, UpdateLogEntryResult, constants};
 
 use bytes::Bytes;
-use deltalake_core::{ObjectStoreError, Path};
 use tracing::{debug, error, warn};
+use typed_builder::TypedBuilder;
 use url::Url;
 
 use deltalake_core::logstore::*;
+use deltalake_core::table::normalize_table_url;
 use deltalake_core::{
-    kernel::transaction::TransactionError, logstore::ObjectStoreRef, DeltaResult, DeltaTableError,
+    DeltaResult, DeltaTableError, ObjectStoreError, kernel::transaction::TransactionError,
+    logstore::ObjectStoreRef,
 };
 use uuid::Uuid;
 
@@ -22,12 +24,20 @@ const STORE_NAME: &str = "DeltaS3ObjectStore";
 const MAX_REPAIR_RETRIES: i64 = 3;
 
 /// [`LogStore`] implementation backed by DynamoDb
+#[derive(TypedBuilder)]
+#[builder(doc)]
 pub struct S3DynamoDbLogStore {
+    /// Object store for delta log operations
     prefixed_store: ObjectStoreRef,
+    /// Root object store
     root_store: ObjectStoreRef,
+    /// DynamoDB lock client for transaction coordination
     lock_client: DynamoDbLockClient,
+    /// Log store configuration
     config: LogStoreConfig,
-    table_path: String,
+    /// Table path URI
+    #[builder(setter(into))]
+    table_path: Url,
 }
 
 impl std::fmt::Debug for S3DynamoDbLogStore {
@@ -45,6 +55,7 @@ impl S3DynamoDbLogStore {
         prefixed_store: ObjectStoreRef,
         root_store: ObjectStoreRef,
     ) -> DeltaResult<Self> {
+        let location = normalize_table_url(&location);
         let lock_client = DynamoDbLockClient::try_new(
             &s3_options.sdk_config.clone().unwrap(),
             s3_options
@@ -71,17 +82,13 @@ impl S3DynamoDbLogStore {
                 source: Box::new(err),
             },
         })?;
-        let table_path = to_uri(&location, &Path::from(""));
-        Ok(Self {
-            prefixed_store,
-            root_store,
-            lock_client,
-            config: LogStoreConfig {
-                location,
-                options: options.clone(),
-            },
-            table_path,
-        })
+        Ok(Self::builder()
+            .prefixed_store(prefixed_store)
+            .root_store(root_store)
+            .lock_client(lock_client)
+            .config(LogStoreConfig::new(&location, options.clone()))
+            .table_path(location)
+            .build())
     }
 
     /// Attempt to repair an incomplete log entry by moving the temporary commit file
@@ -110,7 +117,10 @@ impl S3DynamoDbLogStore {
                 Err(TransactionError::ObjectStore {
                     source: ObjectStoreError::NotFound { .. },
                 }) => {
-                    warn!("It looks like the {}.json has already been moved, we got 404 from ObjectStorage.", entry.version);
+                    warn!(
+                        "It looks like the {}.json has already been moved, we got 404 from ObjectStorage.",
+                        entry.version
+                    );
                     return self.try_complete_entry(entry, false).await;
                 }
                 Err(err) if retry == MAX_REPAIR_RETRIES => return Err(err),
@@ -132,7 +142,7 @@ impl S3DynamoDbLogStore {
         for retry in 0..=MAX_REPAIR_RETRIES {
             match self
                 .lock_client
-                .update_commit_entry(entry.version, &self.table_path)
+                .update_commit_entry(entry.version, self.table_path.as_str())
                 .await
                 .map_err(|err| TransactionError::LogStoreError {
                     msg: format!(
@@ -174,14 +184,10 @@ impl LogStore for S3DynamoDbLogStore {
         "S3DynamoDbLogStore".into()
     }
 
-    fn root_uri(&self) -> String {
-        self.table_path.clone()
-    }
-
     async fn refresh(&self) -> DeltaResult<()> {
         let entry = self
             .lock_client
-            .get_latest_entry(&self.table_path)
+            .get_latest_entry(self.table_path.as_str())
             .await
             .map_err(|err| DeltaTableError::GenericError {
                 source: Box::new(err),
@@ -195,7 +201,7 @@ impl LogStore for S3DynamoDbLogStore {
     async fn read_commit_entry(&self, version: i64) -> DeltaResult<Option<Bytes>> {
         let entry = self
             .lock_client
-            .get_commit_entry(&self.table_path, version)
+            .get_commit_entry(self.table_path.as_ref(), version)
             .await;
         if let Ok(Some(entry)) = entry {
             self.repair_entry(&entry).await?;
@@ -218,11 +224,14 @@ impl LogStore for S3DynamoDbLogStore {
             CommitOrBytes::TmpCommit(tmp_commit) => tmp_commit,
             _ => unreachable!(), // S3DynamoDBLogstore should never get Bytes
         };
-        let entry = CommitEntry::new(version, tmp_commit.clone());
+        let entry = CommitEntry::builder()
+            .version(version)
+            .temp_path(tmp_commit.clone())
+            .build();
         debug!("Writing commit entry for {self:?}: {entry:?}");
         // create log entry in dynamo db: complete = false, no expireTime
         self.lock_client
-            .put_commit_entry(&self.table_path, &entry)
+            .put_commit_entry(self.table_path.as_str(), &entry)
             .await
             .map_err(|err| match err {
                 LockClientError::VersionAlreadyExists { version, .. } => {
@@ -269,7 +278,7 @@ impl LogStore for S3DynamoDbLogStore {
             _ => unreachable!(), // S3DynamoDBLogstore should never get Bytes
         };
         self.lock_client
-            .delete_commit_entry(version, &self.table_path)
+            .delete_commit_entry(version, self.table_path.as_str())
             .await
             .map_err(|err| match err {
                 LockClientError::ProvisionedThroughputExceeded => todo!(
@@ -296,7 +305,7 @@ impl LogStore for S3DynamoDbLogStore {
         debug!("Retrieving latest version of {self:?} at v{current_version}");
         let entry = self
             .lock_client
-            .get_latest_entry(&self.table_path)
+            .get_latest_entry(self.table_path.as_str())
             .await
             .map_err(|err| DeltaTableError::GenericError {
                 source: Box::new(err),
@@ -335,3 +344,6 @@ pub enum RepairLogEntryResult {
     /// Both parts of the repair process where already carried.
     AlreadyCompleted,
 }
+
+#[cfg(test)]
+mod tests {}

@@ -26,17 +26,16 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use futures::future::{ready, BoxFuture};
+use futures::future::{BoxFuture, ready};
 use futures::{StreamExt, TryStreamExt};
-use object_store::Error;
-use object_store::{path::Path, ObjectStore};
+use object_store::{Error, ObjectStore, path::Path};
 use serde::Serialize;
 use tracing::*;
 
 use super::{CustomExecuteHandler, Operation};
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
-use crate::kernel::EagerSnapshot;
+use crate::kernel::{EagerSnapshot, resolve_snapshot};
 use crate::logstore::{LogStore, LogStoreRef};
 use crate::protocol::DeltaOperation;
 use crate::table::config::TablePropertiesExt as _;
@@ -94,7 +93,7 @@ pub enum VacuumMode {
 /// See this module's documentation for more information
 pub struct VacuumBuilder {
     /// A snapshot of the to-be-vacuumed table's state
-    snapshot: EagerSnapshot,
+    snapshot: Option<EagerSnapshot>,
     /// Delta object store for handling data files
     log_store: LogStoreRef,
     /// Period of stale files allowed.
@@ -114,7 +113,7 @@ pub struct VacuumBuilder {
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
-impl super::Operation<()> for VacuumBuilder {
+impl super::Operation for VacuumBuilder {
     fn log_store(&self) -> &LogStoreRef {
         &self.log_store
     }
@@ -155,7 +154,7 @@ pub struct VacuumEndOperationMetrics {
 /// Methods to specify various vacuum options and to execute the operation
 impl VacuumBuilder {
     /// Create a new [`VacuumBuilder`]
-    pub fn new(log_store: LogStoreRef, snapshot: EagerSnapshot) -> Self {
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
         VacuumBuilder {
             snapshot,
             log_store,
@@ -222,13 +221,18 @@ impl VacuumBuilder {
     }
 
     /// Determine which files can be deleted. Does not actually perform the deletion
-    async fn create_vacuum_plan(&self) -> Result<VacuumPlan, VacuumError> {
+    async fn create_vacuum_plan(
+        &self,
+        snapshot: &EagerSnapshot,
+    ) -> Result<VacuumPlan, VacuumError> {
         if self.mode == VacuumMode::Full {
-            info!("Vacuum configured to run with 'VacuumMode::Full'. It will scan for orphaned parquet files in the Delta table directory and remove those as well!");
+            info!(
+                "Vacuum configured to run with 'VacuumMode::Full'. It will scan for orphaned parquet files in the Delta table directory and remove those as well!"
+            );
         }
 
         let min_retention = Duration::milliseconds(
-            self.snapshot
+            snapshot
                 .table_properties()
                 .deleted_file_retention_duration()
                 .as_millis() as i64,
@@ -262,7 +266,9 @@ impl VacuumBuilder {
                 for version in sorted_versions {
                     state.update(&self.log_store, Some(version)).await?;
                     let files: Vec<String> = state
-                        .file_paths_iter()
+                        .log_data()
+                        .into_iter()
+                        .map(|add| add.object_store_path())
                         .map(|path| path.to_string())
                         .collect();
                     debug!("keep version:{version}\n, {files:#?}");
@@ -274,15 +280,9 @@ impl VacuumBuilder {
             _ => HashSet::new(),
         };
 
-        let expired_tombstones = get_stale_files(
-            &self.snapshot,
-            retention_period,
-            now_millis,
-            &self.log_store,
-        )
-        .await?;
-        let valid_files: HashSet<_> = self
-            .snapshot
+        let expired_tombstones =
+            get_stale_files(snapshot, retention_period, now_millis, &self.log_store).await?;
+        let valid_files: HashSet<_> = snapshot
             .file_views(self.log_store.as_ref(), None)
             .map_ok(|f| f.object_store_path())
             .try_collect()
@@ -294,7 +294,7 @@ impl VacuumBuilder {
 
         let list_span = info_span!("list_files", operation = "vacuum");
         let mut all_files = list_span.in_scope(|| object_store.list(None));
-        let partition_columns = self.snapshot.metadata().partition_columns();
+        let partition_columns = snapshot.metadata().partition_columns();
 
         let mut file_count = 0;
         while let Some(obj_meta) = all_files.next().await {
@@ -333,10 +333,16 @@ impl VacuumBuilder {
                     continue;
                 }
                 if self.mode == VacuumMode::Lite {
-                    debug!("The file {:?} was not referenced in a log file, but VacuumMode::Lite means it will not be vacuumed", &obj_meta.location);
+                    debug!(
+                        "The file {:?} was not referenced in a log file, but VacuumMode::Lite means it will not be vacuumed",
+                        &obj_meta.location
+                    );
                     continue;
                 } else {
-                    debug!("The file {:?} was not referenced in a log file, but VacuumMode::Full means it *will be vacuumed*", &obj_meta.location);
+                    debug!(
+                        "The file {:?} was not referenced in a log file, but VacuumMode::Full means it *will be vacuumed*",
+                        &obj_meta.location
+                    );
                 }
             }
 
@@ -366,27 +372,27 @@ impl std::future::IntoFuture for VacuumBuilder {
     fn into_future(self) -> Self::IntoFuture {
         let this = self;
         Box::pin(async move {
-            if !&this.snapshot.load_config().require_files {
-                return Err(DeltaTableError::NotInitializedWithFiles("VACUUM".into()));
-            }
+            let snapshot =
+                resolve_snapshot(&this.log_store, this.snapshot.clone(), true, None).await?;
+            let plan = this.create_vacuum_plan(&snapshot).await?;
 
-            let plan = this.create_vacuum_plan().await?;
             if this.dry_run {
                 return Ok((
-                    DeltaTable::new_with_state(this.log_store, DeltaTableState::new(this.snapshot)),
+                    DeltaTable::new_with_state(this.log_store, DeltaTableState::new(snapshot)),
                     VacuumMetrics {
                         files_deleted: plan.files_to_delete.iter().map(|f| f.to_string()).collect(),
                         dry_run: true,
                     },
                 ));
             }
+
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
             let result = plan
                 .execute(
                     this.log_store.clone(),
-                    &this.snapshot,
+                    &snapshot,
                     this.commit_properties.clone(),
                     operation_id,
                     this.get_custom_execute_handler(),
@@ -401,7 +407,7 @@ impl std::future::IntoFuture for VacuumBuilder {
                     metrics,
                 ),
                 None => (
-                    DeltaTable::new_with_state(this.log_store, DeltaTableState::new(this.snapshot)),
+                    DeltaTable::new_with_state(this.log_store, DeltaTableState::new(snapshot)),
                     Default::default(),
                 ),
             })
@@ -547,10 +553,10 @@ async fn get_stale_files(
 
 #[cfg(test)]
 mod tests {
-    use object_store::{local::LocalFileSystem, memory::InMemory, PutPayload};
+    use object_store::{PutPayload, local::LocalFileSystem, memory::InMemory};
 
     use super::*;
-    use crate::{checkpoints::create_checkpoint, ensure_table_uri, open_table};
+    use crate::{ensure_table_uri, open_table};
     use std::path::Path;
     use std::{io::Read, time::SystemTime};
     use url::Url;
@@ -563,7 +569,7 @@ mod tests {
         let table = open_table(table_uri).await?;
 
         let (_table, result) =
-            VacuumBuilder::new(table.log_store(), table.snapshot()?.snapshot.clone())
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
                 .with_retention_period(Duration::hours(0))
                 .with_dry_run(true)
                 .with_mode(VacuumMode::Lite)
@@ -574,7 +580,7 @@ mod tests {
         assert!(result.files_deleted.is_empty());
 
         let (_table, result) =
-            VacuumBuilder::new(table.log_store(), table.snapshot()?.snapshot.clone())
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
                 .with_retention_period(Duration::hours(0))
                 .with_dry_run(true)
                 .with_mode(VacuumMode::Full)
@@ -608,7 +614,7 @@ mod tests {
 
         // First, vacuum without keeping any particular versions
         let (_table, result) =
-            VacuumBuilder::new(table.log_store(), table.snapshot()?.snapshot.clone())
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
                 .with_retention_period(Duration::hours(0))
                 .with_dry_run(true)
                 .with_mode(VacuumMode::Full)
@@ -620,7 +626,7 @@ mod tests {
 
         // Next, vacuum with specific versions retained
         let (_table, result) =
-            VacuumBuilder::new(table.log_store(), table.snapshot()?.snapshot.clone())
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
                 .with_retention_period(Duration::hours(0))
                 .with_keep_versions(&versions_to_keep)
                 .with_dry_run(true)
@@ -647,7 +653,7 @@ mod tests {
 
         // First, vacuum without keeping any particular versions
         let (_table, result) =
-            VacuumBuilder::new(table.log_store(), table.snapshot()?.snapshot.clone())
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
                 .with_retention_period(Duration::hours(0))
                 .with_dry_run(true)
                 .with_mode(VacuumMode::Full)
@@ -659,7 +665,7 @@ mod tests {
 
         // Next, vacuum with specific versions retained
         let (_table, result) =
-            VacuumBuilder::new(table.log_store(), table.snapshot()?.snapshot.clone())
+            VacuumBuilder::new(table.log_store(), Some(table.snapshot()?.snapshot.clone()))
                 .with_retention_period(Duration::hours(0))
                 .with_keep_versions(&versions_to_keep)
                 .with_dry_run(true)
@@ -717,16 +723,17 @@ mod tests {
                 .unwrap();
         }
 
-        let mut table = crate::DeltaTableBuilder::from_valid_uri("memory:///")
+        let table_url = url::Url::parse("memory:///").unwrap();
+        let mut table = crate::DeltaTableBuilder::from_url(table_url.clone())
             .unwrap()
-            .with_storage_backend(Arc::new(store), url::Url::parse("memory:///").unwrap())
+            .with_storage_backend(Arc::new(store), table_url)
             .build()
             .unwrap();
         table.load().await.unwrap();
 
         let (mut table, result) = VacuumBuilder::new(
             table.log_store(),
-            table.snapshot().unwrap().snapshot.clone(),
+            Some(table.snapshot().unwrap().snapshot.clone()),
         )
         .with_retention_period(Duration::hours(0))
         .with_keep_versions(&[2, 3])
@@ -738,12 +745,16 @@ mod tests {
         assert_ne!(32, result.files_deleted.len());
 
         // Can we checkpoint it?
-        create_checkpoint(&table, None).await.unwrap();
+        crate::checkpoints::create_checkpoint(&table, None)
+            .await
+            .unwrap();
         table.load().await.unwrap();
         assert_eq!(Some(6), table.version());
 
         let ctx = SessionContext::new();
-        ctx.register_table("test", Arc::new(table)).unwrap();
+        table.update_datafusion_session(&ctx.state()).unwrap();
+        ctx.register_table("test", table.table_provider().await.unwrap())
+            .unwrap();
         let _batches = ctx
             .sql("SELECT * FROM test")
             .await
@@ -762,7 +773,7 @@ mod tests {
 
         let result = VacuumBuilder::new(
             table.log_store(),
-            table.snapshot().unwrap().snapshot.clone(),
+            Some(table.snapshot().unwrap().snapshot.clone()),
         )
         .with_retention_period(Duration::hours(1))
         .with_dry_run(true)
@@ -777,7 +788,7 @@ mod tests {
 
         let (table, result) = VacuumBuilder::new(
             table.log_store(),
-            table.snapshot().unwrap().snapshot.clone(),
+            Some(table.snapshot().unwrap().snapshot.clone()),
         )
         .with_retention_period(Duration::hours(0))
         .with_dry_run(true)
@@ -791,7 +802,7 @@ mod tests {
 
         let (table, result) = VacuumBuilder::new(
             table.log_store(),
-            table.snapshot().unwrap().snapshot.clone(),
+            Some(table.snapshot().unwrap().snapshot.clone()),
         )
         .with_retention_period(Duration::hours(169))
         .with_dry_run(true)
@@ -810,7 +821,7 @@ mod tests {
         let empty: Vec<String> = Vec::new();
         let (_table, result) = VacuumBuilder::new(
             table.log_store(),
-            table.snapshot().unwrap().snapshot.clone(),
+            Some(table.snapshot().unwrap().snapshot.clone()),
         )
         .with_retention_period(Duration::hours(retention_hours as i64))
         .with_dry_run(true)
@@ -842,7 +853,7 @@ mod tests {
     /// This tests the fix for the race condition where concurrent writer's files could be deleted
     #[tokio::test]
     async fn test_vacuum_full_protects_recent_uncommitted_files() -> DeltaResult<()> {
-        use chrono::{DateTime, Utc};
+        use chrono::DateTime;
         use object_store::GetResultPayload;
 
         let store = InMemory::new();
@@ -874,9 +885,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut table = crate::DeltaTableBuilder::from_valid_uri("memory:///")
+        let table_url = url::Url::parse("memory:///").unwrap();
+        let mut table = crate::DeltaTableBuilder::from_url(table_url.clone())
             .unwrap()
-            .with_storage_backend(Arc::new(store), url::Url::parse("memory:///").unwrap())
+            .with_storage_backend(Arc::new(store), table_url)
             .build()
             .unwrap();
         table.load().await.unwrap();
@@ -891,7 +903,7 @@ mod tests {
         // The recent file should NOT be deleted because it's too new
         let (_table, result) = VacuumBuilder::new(
             table.log_store(),
-            table.snapshot().unwrap().snapshot.clone(),
+            Some(table.snapshot().unwrap().snapshot.clone()),
         )
         .with_retention_period(Duration::days(7))
         .with_dry_run(true)

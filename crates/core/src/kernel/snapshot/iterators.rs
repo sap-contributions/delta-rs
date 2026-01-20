@@ -12,15 +12,17 @@ use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
 use delta_kernel::expressions::{Scalar, StructData};
 use delta_kernel::scan::scan_row_schema;
 use delta_kernel::schema::DataType;
-use object_store::path::Path;
 use object_store::ObjectMeta;
+use object_store::path::Path;
 use percent_encoding::percent_decode_str;
 
+#[cfg(feature = "datafusion")]
+pub(crate) use self::scan_row::parse_stats_column_with_schema;
 use crate::kernel::scalars::ScalarExt;
 use crate::kernel::{Add, DeletionVectorDescriptor, Remove};
 use crate::{DeltaResult, DeltaTableError};
 
-pub(crate) use self::scan_row::{scan_row_in_eval, ScanRowOutStream};
+pub(crate) use self::scan_row::{ScanRowOutStream, scan_row_in_eval};
 pub use self::tombstones::TombstoneView;
 
 mod scan_row;
@@ -113,14 +115,20 @@ impl LogicalFileView {
         percent_decode_str(raw).decode_utf8_lossy()
     }
 
+    /// Returns the raw file path as stored in the log, without URL decoding.
+    pub(crate) fn path_raw(&self) -> &str {
+        get_string_value(
+            self.files
+                .column(*FIELD_INDICES.get(FIELD_NAME_PATH).unwrap()),
+            self.index,
+        )
+        .unwrap()
+    }
+
     /// An object store [`Path`] to the file.
     ///
     /// this tries to parse the file string and if that fails, it will return the string as is.
     // TODO assert consistent handling of the paths encoding when reading log data so this logic can be removed.
-    #[deprecated(
-        since = "0.27.1",
-        note = "Will no longer be meaningful once we have full url support"
-    )]
     pub(crate) fn object_store_path(&self) -> Path {
         let path = self.path();
         // Try to preserve percent encoding if possible
@@ -214,7 +222,7 @@ impl LogicalFileView {
         self.stats_parsed()
             .and_then(|stats| stats.column_by_name(STATS_FIELD_NUM_RECORDS))
             .and_then(|col| col.as_primitive_opt::<Int64Type>())
-            .map(|a| a.value(self.index) as usize)
+            .and_then(|a| a.is_valid(self.index).then(|| a.value(self.index) as usize))
     }
 
     /// Returns null counts for all columns in this file as structured data.
@@ -334,8 +342,8 @@ where
         Scalar::Timestamp(v) => Scalar::Timestamp(func(v)),
         Scalar::TimestampNtz(v) => Scalar::TimestampNtz(func(v)),
         Scalar::Struct(struct_data) => {
-            let mut fields = Vec::new();
-            let mut scalars = Vec::new();
+            let mut fields = Vec::with_capacity(struct_data.fields().len());
+            let mut scalars = Vec::with_capacity(struct_data.values().len());
 
             for (field, value) in struct_data.fields().iter().zip(struct_data.values().iter()) {
                 fields.push(field.clone());

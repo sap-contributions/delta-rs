@@ -25,13 +25,13 @@ use super::utils::{
     record_batch_without_partitions,
 };
 use super::{DeltaWriter, DeltaWriterError, WriteMode};
+use crate::DeltaTable;
 use crate::errors::DeltaTableError;
-use crate::kernel::{scalars::ScalarExt, Add, PartitionsExt};
+use crate::kernel::{Add, PartitionsExt, scalars::ScalarExt};
 use crate::logstore::ObjectStoreRetryExt;
-use crate::table::builder::{ensure_table_uri, DeltaTableBuilder};
+use crate::table::builder::DeltaTableBuilder;
 use crate::table::config::TablePropertiesExt as _;
 use crate::writer::utils::ShareableBuffer;
-use crate::DeltaTable;
 
 type BadValue = (Value, ParquetError);
 
@@ -94,7 +94,9 @@ impl DataArrowWriter {
         json_buffer: Vec<Value>,
         parquet_error: ParquetError,
     ) -> Result<(), DeltaWriterError> {
-        warn!("Failed with parquet error while writing record batch. Attempting quarantine of bad records.");
+        warn!(
+            "Failed with parquet error while writing record batch. Attempting quarantine of bad records."
+        );
         let (good, bad) = quarantine_failed_parquet_rows(arrow_schema.clone(), json_buffer)?;
         let record_batch = record_batch_from_message(arrow_schema, good.as_slice())?;
         self.write_record_batch(partition_columns, record_batch)
@@ -191,7 +193,7 @@ impl JsonWriter {
         partition_columns: Option<Vec<String>>,
         storage_options: Option<HashMap<String, String>>,
     ) -> Result<Self, DeltaTableError> {
-        let table = DeltaTableBuilder::from_uri(ensure_table_uri(&table_url)?)?
+        let table = DeltaTableBuilder::from_url(table_url)?
             .with_storage_options(storage_options.unwrap_or_default())
             .load()
             .await?;
@@ -317,7 +319,9 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
         mode: WriteMode,
     ) -> Result<(), DeltaTableError> {
         if mode != WriteMode::Default {
-            warn!("The JsonWriter does not currently support non-default write modes, falling back to default mode");
+            warn!(
+                "The JsonWriter does not currently support non-default write modes, falling back to default mode"
+            );
         }
         let mut partial_writes: Vec<(Value, ParquetError)> = Vec::new();
         let arrow_schema = self.arrow_schema();
@@ -375,7 +379,7 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
     #[instrument(skip(self), fields(writer_count = 0))]
     async fn flush(&mut self) -> Result<Vec<Add>, DeltaTableError> {
         let writers = std::mem::take(&mut self.arrow_writers);
-        let mut actions = Vec::new();
+        let mut actions = Vec::with_capacity(writers.len());
 
         Span::current().record("writer_count", writers.len());
 
@@ -389,7 +393,7 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
             let obj_bytes = Bytes::from(writer.buffer.to_vec());
             let file_size = obj_bytes.len() as i64;
 
-            debug!(path = %path, size = file_size, rows = metadata.num_rows, "writing data file");
+            debug!(path = %path, size = file_size, rows = metadata.file_metadata().num_rows(), "writing data file");
 
             self.table
                 .object_store()
@@ -432,8 +436,8 @@ fn quarantine_failed_parquet_rows(
     arrow_schema: Arc<ArrowSchema>,
     values: Vec<Value>,
 ) -> Result<(Vec<Value>, Vec<BadValue>), DeltaWriterError> {
-    let mut good: Vec<Value> = Vec::new();
-    let mut bad: Vec<BadValue> = Vec::new();
+    let mut good: Vec<Value> = Vec::with_capacity(values.len());
+    let mut bad: Vec<BadValue> = Vec::with_capacity(values.len());
 
     for value in values {
         let record_batch =
@@ -474,13 +478,14 @@ mod tests {
     use super::*;
 
     use arrow_schema::ArrowError;
+    #[cfg(feature = "datafusion")]
+    use futures::TryStreamExt;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use std::fs::File;
 
     use crate::arrow::array::Int32Array;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-    use crate::ensure_table_uri;
     use crate::operations::create::CreateBuilder;
     use crate::writer::test_utils::get_delta_schema;
 
@@ -507,7 +512,7 @@ mod tests {
         let table = get_test_table(&table_dir).await;
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
@@ -583,7 +588,7 @@ mod tests {
 
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
@@ -659,7 +664,7 @@ mod tests {
             let mut table = get_test_table(&table_dir).await;
 
             let mut writer = JsonWriter::try_new(
-                ensure_table_uri(&table.table_uri()).unwrap(),
+                table.table_url().clone(),
                 table.snapshot().unwrap().snapshot().arrow_schema(),
                 Some(vec!["modified".to_string()]),
                 None,
@@ -766,7 +771,7 @@ mod tests {
         assert_eq!(table.version(), Some(0));
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            crate::ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
@@ -784,10 +789,12 @@ mod tests {
         writer.write(vec![data]).await.unwrap();
         writer.flush_and_commit(&mut table).await.unwrap();
         assert_eq!(table.version(), Some(1));
-        let add_actions = table
-            .state
+        let add_actions: Vec<_> = table
+            .snapshot()
             .unwrap()
-            .file_actions(&table.log_store)
+            .snapshot()
+            .file_views(&table.log_store, None)
+            .try_collect()
             .await
             .unwrap();
         assert_eq!(add_actions.len(), 1);
@@ -798,7 +805,7 @@ mod tests {
                 .into_iter()
                 .next()
                 .unwrap()
-                .stats
+                .stats()
                 .unwrap()
                 .parse::<serde_json::Value>()
                 .unwrap()
@@ -829,7 +836,7 @@ mod tests {
         assert_eq!(table.version(), Some(0));
         let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
         let mut writer = JsonWriter::try_new(
-            crate::ensure_table_uri(&table.table_uri()).unwrap(),
+            table.table_url().clone(),
             arrow_schema,
             Some(vec!["modified".to_string()]),
             None,
@@ -847,10 +854,12 @@ mod tests {
         writer.write(vec![data]).await.unwrap();
         writer.flush_and_commit(&mut table).await.unwrap();
         assert_eq!(table.version(), Some(1));
-        let add_actions = table
-            .state
+        let add_actions: Vec<_> = table
+            .snapshot()
             .unwrap()
-            .file_actions(&table.log_store)
+            .snapshot()
+            .file_views(&table.log_store, None)
+            .try_collect()
             .await
             .unwrap();
         assert_eq!(add_actions.len(), 1);
@@ -861,7 +870,7 @@ mod tests {
                 .into_iter()
                 .next()
                 .unwrap()
-                .stats
+                .stats()
                 .unwrap()
                 .parse::<serde_json::Value>()
                 .unwrap()

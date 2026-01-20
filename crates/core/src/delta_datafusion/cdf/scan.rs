@@ -7,14 +7,14 @@ use datafusion::common::{Column, DFSchema, Result as DataFusionResult};
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::ExecutionPlan;
 
 use crate::{
-    delta_datafusion::DataFusionMixins, operations::load_cdf::CdfLoadBuilder, DeltaResult,
-    DeltaTableError,
+    DeltaResult, DeltaTableError, delta_datafusion::DataFusionMixins,
+    operations::load_cdf::CdfLoadBuilder,
 };
 
 use super::ADD_PARTITION_SCHEMA;
@@ -28,7 +28,15 @@ pub struct DeltaCdfTableProvider {
 impl DeltaCdfTableProvider {
     /// Build a DeltaCDFTableProvider
     pub fn try_new(cdf_builder: CdfLoadBuilder) -> DeltaResult<Self> {
-        let mut fields = cdf_builder.snapshot.input_schema().fields().to_vec();
+        let mut fields = cdf_builder
+            .snapshot
+            .as_ref()
+            .ok_or(DeltaTableError::generic(
+                "expected initialized snapshot for DeltaCdfTableProvider",
+            ))?
+            .input_schema()
+            .fields()
+            .to_vec();
         for f in ADD_PARTITION_SCHEMA.clone() {
             fields.push(f.into());
         }

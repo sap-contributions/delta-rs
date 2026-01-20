@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
@@ -59,7 +59,7 @@ fn bench_simple_actions(c: &mut Criterion) {
     group.bench_function("get_actions", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let result = get_actions(0, &commit_log).await;
+                let result = get_actions(0, &commit_log);
                 black_box(result.unwrap().len())
             })
         });
@@ -80,7 +80,7 @@ fn bench_with_stats(c: &mut Criterion) {
     group.bench_function("get_actions", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let result = get_actions(0, &commit_log).await;
+                let result = get_actions(0, &commit_log);
                 black_box(result.unwrap().len())
             })
         });
@@ -101,7 +101,7 @@ fn bench_full_complexity(c: &mut Criterion) {
     group.bench_function("get_actions", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let result = get_actions(0, &commit_log).await;
+                let result = get_actions(0, &commit_log);
                 black_box(result.unwrap().len())
             })
         });

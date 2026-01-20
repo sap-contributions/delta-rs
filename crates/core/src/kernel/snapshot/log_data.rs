@@ -6,7 +6,6 @@ use delta_kernel::expressions::{Scalar, StructData};
 use delta_kernel::table_configuration::TableConfiguration;
 use delta_kernel::table_properties::TableProperties;
 use indexmap::IndexMap;
-use itertools::Itertools;
 
 use super::super::scalars::ScalarExt;
 use super::iterators::LogicalFileView;
@@ -17,29 +16,32 @@ pub(crate) trait PartitionsExt {
 
 impl PartitionsExt for IndexMap<String, Scalar> {
     fn hive_partition_path(&self) -> String {
-        let fields = self
-            .iter()
-            .map(|(k, v)| {
+        let sep = String::from('/');
+        itertools::Itertools::intersperse(
+            self.iter().map(|(k, v)| {
                 let encoded = v.serialize_encoded();
                 format!("{k}={encoded}")
-            })
-            .collect::<Vec<_>>();
-        fields.join("/")
+            }),
+            sep,
+        )
+        .collect()
     }
 }
 
 impl PartitionsExt for StructData {
     fn hive_partition_path(&self) -> String {
-        let fields = self
-            .fields()
-            .iter()
-            .zip(self.values().iter())
-            .map(|(k, v)| {
-                let encoded = v.serialize_encoded();
-                format!("{}={encoded}", k.name())
-            })
-            .collect::<Vec<_>>();
-        fields.join("/")
+        let sep = String::from('/');
+        itertools::Itertools::intersperse(
+            self.fields()
+                .iter()
+                .zip(self.values().iter())
+                .map(|(k, v)| {
+                    let encoded = v.serialize_encoded();
+                    format!("{}={encoded}", k.name())
+                }),
+            sep,
+        )
+        .collect()
     }
 }
 
@@ -108,10 +110,10 @@ mod datafusion {
     use std::collections::HashSet;
     use std::sync::{Arc, LazyLock};
 
-    use ::datafusion::common::scalar::ScalarValue;
-    use ::datafusion::common::stats::{ColumnStatistics, Precision, Statistics};
     use ::datafusion::common::Column;
     use ::datafusion::common::DataFusionError;
+    use ::datafusion::common::scalar::ScalarValue;
+    use ::datafusion::common::stats::{ColumnStatistics, Precision, Statistics};
     use ::datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
     use ::datafusion::physical_optimizer::pruning::PruningStatistics;
     use ::datafusion::physical_plan::Accumulator;
@@ -123,14 +125,15 @@ mod datafusion {
     use delta_kernel::expressions::Expression;
     use delta_kernel::schema::{DataType, PrimitiveType};
     use delta_kernel::{EvaluationHandler, ExpressionEvaluator};
+    use itertools::Itertools;
 
     use super::*;
     use crate::kernel::arrow::engine_ext::ExpressionEvaluatorExt as _;
     use crate::kernel::arrow::extract::{extract_and_cast_opt, extract_column};
     use crate::{DeltaResult, DeltaTableError};
 
-    use crate::kernel::arrow::extract::extract_and_cast;
     use crate::kernel::ARROW_HANDLER;
+    use crate::kernel::arrow::extract::extract_and_cast;
 
     const COL_NUM_RECORDS: &str = "numRecords";
     const COL_MIN_VALUES: &str = "minValues";
@@ -390,11 +393,13 @@ mod datafusion {
             } else {
                 Expression::column(["stats_parsed", stats_field, &column.name])
             };
-            let evaluator = ARROW_HANDLER.new_expression_evaluator(
-                crate::kernel::models::fields::log_schema_ref().clone(),
-                expression.into(),
-                field.data_type().clone(),
-            );
+            let evaluator = ARROW_HANDLER
+                .new_expression_evaluator(
+                    crate::kernel::models::fields::log_schema_ref().clone(),
+                    expression.into(),
+                    field.data_type().clone(),
+                )
+                .ok()?;
 
             let results: Vec<_> = self
                 .data
@@ -468,11 +473,13 @@ mod datafusion {
         /// Note: the returned array must contain `num_containers()` rows
         fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
             static ROW_COUNTS_EVAL: LazyLock<Arc<dyn ExpressionEvaluator>> = LazyLock::new(|| {
-                ARROW_HANDLER.new_expression_evaluator(
-                    crate::kernel::models::fields::log_schema_ref().clone(),
-                    Expression::column(["add", "stats_parsed", "numRecords"]).into(),
-                    DataType::Primitive(PrimitiveType::Long),
-                )
+                ARROW_HANDLER
+                    .new_expression_evaluator(
+                        crate::kernel::models::fields::log_schema_ref().clone(),
+                        Expression::column(["add", "stats_parsed", "numRecords"]).into(),
+                        DataType::Primitive(PrimitiveType::Long),
+                    )
+                    .expect("Failed to create row counts evaluator")
             });
 
             let results: Vec<_> = self
@@ -551,8 +558,60 @@ mod datafusion {
     }
 }
 
-#[cfg(all(test, feature = "datafusion"))]
+#[cfg(test)]
 mod tests {
+    use super::*;
+    use delta_kernel::schema::DataType;
+    use delta_kernel::schema::PrimitiveType;
+    use delta_kernel::schema::StructField;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_partitionsext_structdata() {
+        let partitions = StructData::try_new(
+            vec![
+                StructField::new("year", DataType::LONG, false),
+                StructField::new("month", DataType::LONG, false),
+                StructField::new("day", DataType::LONG, false),
+            ],
+            vec![Scalar::Long(2025), Scalar::Long(1), Scalar::Long(1)],
+        )
+        .expect("Failed to make StructData");
+        assert_eq!("year=2025/month=1/day=1", partitions.hive_partition_path());
+
+        let partitions = StructData::try_new(
+            vec![StructField::new("year", DataType::LONG, true)],
+            vec![Scalar::Null(DataType::Primitive(PrimitiveType::Long))],
+        )
+        .expect("Failed to make StructData");
+        assert_eq!(
+            "year=__HIVE_DEFAULT_PARTITION__",
+            partitions.hive_partition_path()
+        );
+    }
+
+    #[test]
+    fn test_partitionsext_indexmap() {
+        let partitions: IndexMap<String, Scalar> = IndexMap::from([
+            ("year".to_string(), Scalar::Long(2025)),
+            ("month".to_string(), Scalar::Long(1)),
+            ("day".to_string(), Scalar::Long(1)),
+        ]);
+        assert_eq!("year=2025/month=1/day=1", partitions.hive_partition_path());
+
+        let partitions: IndexMap<String, Scalar> = IndexMap::from([(
+            "year".to_string(),
+            Scalar::Null(DataType::Primitive(PrimitiveType::String)),
+        )]);
+        assert_eq!(
+            "year=__HIVE_DEFAULT_PARTITION__",
+            partitions.hive_partition_path()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "datafusion"))]
+mod df_tests {
     use futures::TryStreamExt;
 
     #[tokio::test]

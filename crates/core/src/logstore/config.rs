@@ -8,11 +8,11 @@
 //! defines how to update internal fields based on key-value pairs.
 #[cfg(feature = "cloud")]
 use ::object_store::RetryConfig;
-use object_store::{path::Path, prefix::PrefixStore, ObjectStore};
+use object_store::{ObjectStore, path::Path, prefix::PrefixStore};
 use std::collections::HashMap;
 
 use super::storage::LimitConfig;
-use super::{storage::runtime::RuntimeConfig, IORuntime};
+use super::{IORuntime, storage::runtime::RuntimeConfig};
 use crate::{DeltaResult, DeltaTableError};
 
 pub trait TryUpdateKey: Default {
@@ -300,6 +300,7 @@ pub fn str_is_truthy(val: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cloud")]
     use std::time::Duration;
 
     // Test retry config parsing

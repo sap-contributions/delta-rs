@@ -8,15 +8,16 @@ compile_error!(
 );
 
 use deltalake_core::logstore::{
-    default_logstore, logstore_factories, object_store::RetryConfig, LogStore, LogStoreFactory,
-    StorageConfig,
+    LogStore, LogStoreFactory, StorageConfig, default_logstore, logstore_factories,
+    object_store::RetryConfig,
 };
-use reqwest::header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION};
 use reqwest::Url;
+use reqwest::header::{AUTHORIZATION, HeaderValue, InvalidHeaderValue};
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
+use typed_builder::TypedBuilder;
 
 use crate::credential::{
     AzureCliCredential, ClientSecretOAuthProvider, CredentialProvider, WorkspaceOAuthProvider,
@@ -29,13 +30,13 @@ use crate::models::{
 
 use deltalake_core::data_catalog::DataCatalogResult;
 use deltalake_core::{
-    ensure_table_uri, DataCatalog, DataCatalogError, DeltaResult, DeltaTableBuilder,
-    DeltaTableError, ObjectStoreError, Path,
+    DataCatalog, DataCatalogError, DeltaResult, DeltaTableBuilder, DeltaTableError,
+    ObjectStoreError, Path, ensure_table_uri,
 };
 
 use crate::client::retry::*;
 use deltalake_core::logstore::{
-    config::str_is_truthy, object_store_factories, ObjectStoreFactory, ObjectStoreRef,
+    ObjectStoreFactory, ObjectStoreRef, config::str_is_truthy, object_store_factories,
 };
 pub mod client;
 pub mod credential;
@@ -95,8 +96,13 @@ pub enum UnityCatalogError {
     MissingCredential,
 
     /// Temporary Credentials Fetch Failure
-    #[error("Unable to get temporary credentials from Unity Catalog.")]
-    TemporaryCredentialsFetchFailure,
+    #[error("Unable to get temporary credentials from Unity Catalog: {error_code}: {message}")]
+    TemporaryCredentialsFetchFailure {
+        /// Error code from Unity Catalog
+        error_code: String,
+        /// Error message from Unity Catalog
+        message: String,
+    },
 
     #[error("Azure CLI error: {message}")]
     AzureCli {
@@ -339,58 +345,69 @@ impl AsRef<str> for UnityCatalogConfigKey {
 }
 
 /// Builder for creating a UnityCatalogClient
-#[derive(Default)]
+#[derive(TypedBuilder)]
+#[builder(doc)]
 pub struct UnityCatalogBuilder {
     /// Url of a Databricks workspace
+    #[builder(default, setter(strip_option, into))]
     workspace_url: Option<String>,
 
     /// Bearer token
+    #[builder(default, setter(strip_option, into))]
     bearer_token: Option<String>,
 
     /// Client id
+    #[builder(default, setter(strip_option, into))]
     client_id: Option<String>,
 
     /// Client secret
+    #[builder(default, setter(strip_option, into))]
     client_secret: Option<String>,
 
     /// Tenant id
+    #[builder(default, setter(strip_option, into))]
     authority_id: Option<String>,
 
     /// Authority host
+    #[builder(default, setter(strip_option, into))]
     authority_host: Option<String>,
 
     /// Msi endpoint for acquiring managed identity token
+    #[builder(default, setter(strip_option, into))]
     msi_endpoint: Option<String>,
 
     /// Object id for use with managed identity authentication
+    #[builder(default, setter(strip_option, into))]
     object_id: Option<String>,
 
     /// Msi resource id for use with managed identity authentication
+    #[builder(default, setter(strip_option, into))]
     msi_resource_id: Option<String>,
 
     /// File containing token for Azure AD workload identity federation
+    #[builder(default, setter(strip_option, into))]
     federated_token_file: Option<String>,
 
     /// When set to true, azure cli has to be used for acquiring access token
+    #[builder(default)]
     use_azure_cli: bool,
 
     /// When set to true, http will be allowed in the catalog url
+    #[builder(default)]
     allow_http_url: bool,
 
     /// Retry config
+    #[builder(default)]
+    #[allow(dead_code)]
     retry_config: RetryConfig,
 
     /// Options for the underlying http client
+    #[builder(default)]
     client_options: client::ClientOptions,
 }
 
 #[allow(deprecated)]
 impl UnityCatalogBuilder {
-    /// Create a new [`UnityCatalogBuilder`] with default values.
-    pub fn new() -> Self {
-        Default::default()
-    }
-
     /// Set an option on the builder via a key - value pair.
     pub fn try_with_option(
         mut self,
@@ -435,69 +452,20 @@ impl UnityCatalogBuilder {
     ///
     /// Environment keys prefixed with "UNITY_" or "DATABRICKS_" will be considered
     pub fn from_env() -> Self {
-        let mut builder = Self::default();
+        let mut builder = Self::builder().build();
         for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                if key.starts_with("UNITY_") || key.starts_with("DATABRICKS_") {
-                    tracing::debug!("Found relevant env: {key}");
-                    if let Ok(config_key) =
-                        UnityCatalogConfigKey::from_str(&key.to_ascii_lowercase())
-                    {
-                        tracing::debug!("Trying: {key} with {value}");
-                        builder = builder.try_with_option(config_key, value).unwrap();
-                    }
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && (key.starts_with("UNITY_") || key.starts_with("DATABRICKS_"))
+            {
+                tracing::debug!("Found relevant env: {key}");
+                if let Ok(config_key) = UnityCatalogConfigKey::from_str(&key.to_ascii_lowercase()) {
+                    tracing::debug!("Trying: {key} with {value}");
+                    builder = builder.try_with_option(config_key, value).unwrap();
                 }
             }
         }
 
         builder
-    }
-
-    /// Set the URL of a Databricks workspace.
-    pub fn with_workspace_url(mut self, url: impl Into<String>) -> Self {
-        self.workspace_url = Some(url.into());
-        self
-    }
-
-    /// Sets the client id for use in client secret or k8s federated credential flow
-    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
-        self.client_id = Some(client_id.into());
-        self
-    }
-
-    /// Sets the client secret for use in client secret flow
-    pub fn with_client_secret(mut self, client_secret: impl Into<String>) -> Self {
-        self.client_secret = Some(client_secret.into());
-        self
-    }
-
-    /// Sets the authority id for use service principal credential based authentication
-    pub fn with_authority_id(mut self, tenant_id: impl Into<String>) -> Self {
-        self.authority_id = Some(tenant_id.into());
-        self
-    }
-
-    /// Set a static bearer token to be used for authorizing requests
-    pub fn with_bearer_token(mut self, bearer_token: impl Into<String>) -> Self {
-        self.bearer_token = Some(bearer_token.into());
-        self
-    }
-
-    /// Set a personal access token (PAT) to be used for authorizing requests
-    pub fn with_access_token(self, access_token: impl Into<String>) -> Self {
-        self.with_bearer_token(access_token)
-    }
-
-    /// Sets the client options, overriding any already set
-    pub fn with_client_options(mut self, options: client::ClientOptions) -> Self {
-        self.client_options = options;
-        self
-    }
-
-    /// Sets the retry config, overriding any already set
-    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
-        self.retry_config = config;
-        self
     }
 
     fn execute_uc_future<F, T>(future: F) -> DeltaResult<T>
@@ -578,7 +546,7 @@ impl UnityCatalogBuilder {
             TableTempCredentialsResponse::Success(temp_creds) => temp_creds
                 .get_credentials()
                 .ok_or_else(|| UnityCatalogError::MissingCredential)?,
-            TableTempCredentialsResponse::Error(_error) => {
+            TableTempCredentialsResponse::Error(rw_error) => {
                 // If that fails attempt to get just read permissions.
                 match unity_catalog
                     .get_temp_table_credentials(catalog_id, database_name, table_name)
@@ -587,7 +555,15 @@ impl UnityCatalogBuilder {
                     TableTempCredentialsResponse::Success(temp_creds) => temp_creds
                         .get_credentials()
                         .ok_or_else(|| UnityCatalogError::MissingCredential)?,
-                    _ => return Err(UnityCatalogError::TemporaryCredentialsFetchFailure),
+                    TableTempCredentialsResponse::Error(read_error) => {
+                        return Err(UnityCatalogError::TemporaryCredentialsFetchFailure {
+                            error_code: read_error.error_code,
+                            message: format!(
+                                "READ_WRITE failed: {}. READ failed: {}",
+                                rw_error.message, read_error.message
+                            ),
+                        });
+                    }
                 }
             }
         };
@@ -651,11 +627,10 @@ impl UnityCatalogBuilder {
             .trim_end_matches('/')
             .to_string();
 
-        let client_options = if self.allow_http_url {
-            self.client_options.with_allow_http(true)
-        } else {
-            self.client_options
-        };
+        let mut client_options = self.client_options;
+        if self.allow_http_url {
+            client_options.allow_http = true;
+        }
         let client = client_options.client()?;
 
         Ok(UnityCatalog {
@@ -735,7 +710,18 @@ impl UnityCatalog {
             .query(&[("catalog_name", catalog_name.as_ref())])
             .send()
             .await?;
-        Ok(resp.json().await?)
+        let status = resp.status();
+        let body = resp.text().await?;
+        serde_json::from_str(&body).map_err(|e| {
+            tracing::error!(
+                "Failed to parse list_schemas response (status {}): {}",
+                status,
+                body
+            );
+            UnityCatalogError::Generic {
+                source: Box::new(e),
+            }
+        })
     }
 
     /// Gets the specified schema within the metastore.#
@@ -896,7 +882,7 @@ impl ObjectStoreFactory for UnityCatalogFactory {
         // TODO(roeap): we should not have to go through the table here.
         // ideally we just create the right storage ...
         let table_url = ensure_table_uri(&table_path)?;
-        let mut builder = DeltaTableBuilder::from_uri(table_url)?;
+        let mut builder = DeltaTableBuilder::from_url(table_url)?;
 
         if let Some(runtime) = &config.runtime {
             builder = builder.with_io_runtime(runtime.clone());
@@ -972,10 +958,10 @@ impl std::fmt::Debug for UnityCatalog {
 
 #[cfg(test)]
 mod tests {
+    use crate::UnityCatalogBuilder;
     use crate::client::ClientOptions;
     use crate::models::tests::{GET_SCHEMA_RESPONSE, GET_TABLE_RESPONSE, LIST_SCHEMAS_RESPONSE};
     use crate::models::*;
-    use crate::UnityCatalogBuilder;
     use deltalake_core::DataCatalog;
     use httpmock::prelude::*;
     use std::collections::HashMap;
@@ -984,12 +970,13 @@ mod tests {
     async fn test_unity_client() {
         let server = MockServer::start_async().await;
 
-        let options = ClientOptions::default().with_allow_http(true);
+        let options = ClientOptions::builder().allow_http(true).build();
 
-        let client = UnityCatalogBuilder::new()
-            .with_workspace_url(server.url(""))
-            .with_bearer_token("bearer_token")
-            .with_client_options(options)
+        let client = UnityCatalogBuilder::builder()
+            .workspace_url(server.url(""))
+            .bearer_token("bearer_token")
+            .client_options(options)
+            .build()
             .build()
             .unwrap();
 
@@ -1056,7 +1043,8 @@ mod tests {
         );
         storage_options.insert("databricks_token".to_string(), "test_token".to_string());
 
-        let builder = UnityCatalogBuilder::new()
+        let builder = UnityCatalogBuilder::builder()
+            .build()
             .try_with_options(&storage_options)
             .unwrap();
 
@@ -1078,7 +1066,8 @@ mod tests {
         storage_options.insert("unity_client_secret".to_string(), "test_secret".to_string());
         storage_options.insert("unity_authority_id".to_string(), "test_tenant".to_string());
 
-        let builder = UnityCatalogBuilder::new()
+        let builder = UnityCatalogBuilder::builder()
+            .build()
             .try_with_options(&storage_options)
             .unwrap();
 
@@ -1093,8 +1082,10 @@ mod tests {
 
     #[test]
     fn test_env_with_storage_options_override() {
-        std::env::set_var("DATABRICKS_HOST", "https://env.databricks.com");
-        std::env::set_var("DATABRICKS_TOKEN", "env_token");
+        unsafe {
+            std::env::set_var("DATABRICKS_HOST", "https://env.databricks.com");
+            std::env::set_var("DATABRICKS_TOKEN", "env_token");
+        }
 
         let mut storage_options = HashMap::new();
         storage_options.insert(
@@ -1112,8 +1103,10 @@ mod tests {
         );
         assert_eq!(builder.bearer_token, Some("env_token".to_string()));
 
-        std::env::remove_var("DATABRICKS_HOST");
-        std::env::remove_var("DATABRICKS_TOKEN");
+        unsafe {
+            std::env::remove_var("DATABRICKS_HOST");
+            std::env::remove_var("DATABRICKS_TOKEN");
+        }
     }
 
     #[test]
@@ -1134,7 +1127,9 @@ mod tests {
             let test_value = format!("test_value_for_{}", key);
             storage_options.insert(key.to_string(), test_value.clone());
 
-            let result = UnityCatalogBuilder::new().try_with_options(&storage_options);
+            let result = UnityCatalogBuilder::builder()
+                .build()
+                .try_with_options(&storage_options);
             assert!(result.is_ok(), "Failed to parse key: {}", key);
 
             let builder = result.unwrap();
@@ -1152,7 +1147,9 @@ mod tests {
         let mut storage_options = HashMap::new();
         storage_options.insert("invalid_key".to_string(), "test_value".to_string());
 
-        let result = UnityCatalogBuilder::new().try_with_options(&storage_options);
+        let result = UnityCatalogBuilder::builder()
+            .build()
+            .try_with_options(&storage_options);
         assert!(result.is_err());
     }
 
@@ -1172,7 +1169,8 @@ mod tests {
             storage_options.insert("unity_allow_http_url".to_string(), value.to_string());
             storage_options.insert("unity_use_azure_cli".to_string(), value.to_string());
 
-            let builder = UnityCatalogBuilder::new()
+            let builder = UnityCatalogBuilder::builder()
+                .build()
                 .try_with_options(&storage_options)
                 .unwrap();
 
@@ -1204,13 +1202,14 @@ mod tests {
             let result = UnityCatalogBuilder::get_uc_location_and_token(uri, None).await;
             assert!(result.is_err(), "Expected error for URI: {}", uri);
 
-            if let Err(e) = result {
-                if uri.starts_with("uc://") && uri.len() > 5 {
-                    assert!(matches!(
-                        e,
-                        crate::UnityCatalogError::InvalidTableURI { .. }
-                    ));
-                }
+            if let Err(e) = result
+                && uri.starts_with("uc://")
+                && uri.len() > 5
+            {
+                assert!(matches!(
+                    e,
+                    crate::UnityCatalogError::InvalidTableURI { .. }
+                ));
             }
         }
     }

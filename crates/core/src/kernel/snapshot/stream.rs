@@ -1,15 +1,16 @@
 //! the code in this file is hoisted from datafusion with only slight modifications
 //!
-use std::pin::Pin;
-
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use futures::stream::BoxStream;
 use futures::{Future, Stream, StreamExt};
+use std::pin::Pin;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
+use tracing::Span;
+use tracing::dispatcher;
 
-use crate::errors::DeltaResult;
 use crate::DeltaTableError;
+use crate::errors::DeltaResult;
 
 /// Trait for types that stream [RecordBatch]
 ///
@@ -88,6 +89,7 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
 
     /// Spawn task that will be aborted if this builder (or the stream
     /// built from it) are dropped
+    #[allow(unused)]
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = DeltaResult<()>>,
@@ -106,7 +108,16 @@ impl<O: Send + 'static> ReceiverStreamBuilder<O> {
         F: FnOnce() -> DeltaResult<()>,
         F: Send + 'static,
     {
-        self.join_set.spawn_blocking(f);
+        // Capture the current dispatcher and span
+        let dispatch = dispatcher::get_default(|d| d.clone());
+        let span = Span::current();
+
+        self.join_set.spawn_blocking(move || {
+            dispatcher::with_default(&dispatch, || {
+                let _enter = span.enter();
+                f()
+            })
+        });
     }
 
     /// Create a stream of all data written to `tx`

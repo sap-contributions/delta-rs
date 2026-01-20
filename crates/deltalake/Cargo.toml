@@ -1,6 +1,6 @@
 [package]
 name = "deltalake"
-version = "0.29.0"
+version = "0.30.1"
 authors.workspace = true
 keywords.workspace = true
 readme.workspace = true
@@ -14,28 +14,29 @@ rust-version.workspace = true
 [package.metadata.docs.rs]
 # We cannot use all_features because TLS features are mutually exclusive.
 features = [
-    "azure",
-    "datafusion",
-    "gcs",
-    "hdfs",
-    "json",
-    "python",
-    "s3",
-    "unity-experimental",
-    "hdlfs",
+  "azure",
+  "datafusion",
+  "gcs",
+  "hdfs",
+  "json",
+  "python",
+  "s3",
+  "unity-experimental",
+  "hdlfs",
 ]
 
 [dependencies]
-deltalake-core = { version = "0.29.0", path = "../core", default-features = false }
-deltalake-aws = { version = "0.12.0", path = "../aws", default-features = false, optional = true }
-deltalake-azure = { version = "0.12.0", path = "../azure", optional = true }
-deltalake-gcp = { version = "0.13.0", path = "../gcp", optional = true }
-deltalake-hdfs = { version = "0.13.0", path = "../hdfs", optional = true }
-deltalake-lakefs = { version = "0.12.0", path = "../lakefs", optional = true }
-deltalake-catalog-glue = { version = "0.13.0", path = "../catalog-glue", optional = true }
-deltalake-catalog-unity = { version = "0.13.0", path = "../catalog-unity", optional = true }
+deltalake-core = { version = "0.30.0", path = "../core", default-features = false }
+deltalake-aws = { version = "0.13.0", path = "../aws", default-features = false, optional = true }
+deltalake-azure = { version = "0.13.0", path = "../azure", optional = true }
+deltalake-gcp = { version = "0.14.0", path = "../gcp", optional = true }
+deltalake-hdfs = { version = "0.14.0", path = "../hdfs", optional = true }
+deltalake-lakefs = { version = "0.13.0", path = "../lakefs", optional = true }
+deltalake-catalog-glue = { version = "0.14.0", path = "../catalog-glue", optional = true }
+deltalake-catalog-unity = { version = "0.14.0", path = "../catalog-unity", optional = true }
 delta_kernel = { workspace = true }
 deltalake-hdlfs = { version = "0.1.0", path = "../hdlfs", optional = true }
+ctor = "0.6"
 
 [features]
 # All of these features are just reflected into the core crate until that
@@ -55,7 +56,7 @@ unity-experimental = ["deltalake-catalog-unity"]
 lakefs = ["deltalake-lakefs"]
 native-tls = ["deltalake-core/native-tls"]
 rustls = ["deltalake-core/rustls"]
-hdlfs =  ["deltalake-hdlfs"]
+hdlfs = ["deltalake-hdlfs"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

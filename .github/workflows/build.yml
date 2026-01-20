@@ -32,11 +32,14 @@ jobs:
           # if we ever get rid of all the clippy warnings, we can remove this line
           rustflags: ""
 
+      - name: load DAT
+        run: make setup-dat
+
       - name: Rustfmt Check
         uses: actions-rust-lang/rustfmt@v1
 
       - name: build and lint with clippy
-        run: cargo clippy --features ${{ env.DEFAULT_FEATURES }} --tests
+        run: cargo clippy --profile=ci --features ${{ env.DEFAULT_FEATURES }} --tests
 
       - name: Run Machete to check for unused dependencies
         uses: bnjbvr/cargo-machete@aa070c61641e482bc2b5d41c97b496ee4755bf37
@@ -81,18 +84,24 @@ jobs:
           cache: true
           # if we ever get rid of all the clippy warnings, we can remove this line
           rustflags: ""
+      
+      - name: Set up Python 3.13
+        if: matrix.os == 'windows-latest'
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.13
 
       - name: Default build
-        run: cargo build --package deltalake
+        run: cargo build --profile=ci --package deltalake
 
       - name: Default features with clippy
-        run: cargo clippy --features ${{ env.DEFAULT_FEATURES }}
+        run: cargo clippy --profile=ci --features ${{ env.DEFAULT_FEATURES }}
 
       - name: Spot-check build for native-tls features
-        run: cargo build --no-default-features --features azure,datafusion,s3-native-tls,gcs,glue
+        run: cargo build --profile=ci --no-default-features --features azure,datafusion,s3-native-tls,gcs,glue
 
       - name: Check no default features (except rustls)
-        run: cargo check --no-default-features --features rustls
+        run: cargo check --profile=ci --no-default-features --features rustls
 
   test:
     name: Unit Tests
@@ -118,6 +127,23 @@ jobs:
           cache: true
           # if we ever get rid of all the clippy warnings, we can remove this line
           rustflags: ""
+
+      - name: Claim disk space
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo rm -rf /opt/microsoft || true                #   783M
+          sudo rm -rf /usr/local/julia* || true             #  1008M
+          sudo rm -rf /usr/local/share/chromium || true     #   613M
+          sudo rm -rf /usr/local/share/powershell || true   #  1244M
+          sudo rm -rf /usr/share/swift || true              #  3207M
+          sudo df -TBG /
+
+      - name: Set up Python 3.13
+        if: matrix.os == 'windows-latest'
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.13
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

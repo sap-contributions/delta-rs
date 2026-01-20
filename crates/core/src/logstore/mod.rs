@@ -53,35 +53,35 @@ use std::sync::{Arc, LazyLock};
 use bytes::Bytes;
 #[cfg(feature = "datafusion")]
 use datafusion::datasource::object_store::ObjectStoreUrl;
+use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::path::{LogPathFileType, ParsedLogPath};
 use delta_kernel::{AsAny, Engine};
 use futures::StreamExt;
 use object_store::ObjectStoreScheme;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
+use object_store::{Error as ObjectStoreError, ObjectStore, path::Path};
 use regex::Regex;
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 use tokio::runtime::RuntimeFlavor;
-use tokio::task::spawn_blocking;
 use tracing::*;
 use url::Url;
 use uuid::Uuid;
 
 use crate::kernel::transaction::TransactionError;
-use crate::kernel::Action;
+use crate::kernel::{Action, spawn_blocking_with_span};
+use crate::table::normalize_table_url;
 use crate::{DeltaResult, DeltaTableError};
 
 pub use self::config::StorageConfig;
 pub use self::factories::{
-    logstore_factories, object_store_factories, store_for, LogStoreFactory,
-    LogStoreFactoryRegistry, ObjectStoreFactory, ObjectStoreFactoryRegistry,
+    LogStoreFactory, LogStoreFactoryRegistry, ObjectStoreFactory, ObjectStoreFactoryRegistry,
+    logstore_factories, object_store_factories, store_for,
 };
 pub use self::storage::utils::commit_uri_from_version;
 pub use self::storage::{
@@ -103,7 +103,7 @@ trait LogStoreFactoryExt {
     /// ## Parameters
     ///
     /// - `root_store`: and instance of [`ObjectStoreRef`] with no prefix o.a. applied.
-    ///   I.e. pointing to the root of the onject store.
+    ///   I.e. pointing to the root of the object store.
     /// - `location`: The location of the delta table (where the `_delta_log` directory is).
     /// - `options`: The options for the log store.
     fn with_options_internal(
@@ -149,10 +149,7 @@ pub fn default_logstore(
     Arc::new(default_logstore::DefaultLogStore::new(
         prefixed_store,
         root_store,
-        LogStoreConfig {
-            location: location.clone(),
-            options: options.clone(),
-        },
+        LogStoreConfig::new(location, options.clone()),
     ))
 }
 
@@ -174,26 +171,26 @@ pub(crate) static DELTA_LOG_REGEX: LazyLock<Regex> =
 /// # use url::Url;
 /// let location = Url::parse("memory:///").expect("Failed to make location");
 /// let storage_config = StorageConfig::default();
-/// let logstore = logstore_for(location, storage_config).expect("Failed to get a logstore");
+/// let logstore = logstore_for(&location, storage_config).expect("Failed to get a logstore");
 /// ```
-pub fn logstore_for(location: Url, storage_config: StorageConfig) -> DeltaResult<LogStoreRef> {
+pub fn logstore_for(location: &Url, storage_config: StorageConfig) -> DeltaResult<LogStoreRef> {
     // turn location into scheme
     let scheme = Url::parse(&format!("{}://", location.scheme()))
         .map_err(|_| DeltaTableError::InvalidTableLocation(location.clone().into()))?;
 
     if let Some(entry) = object_store_factories().get(&scheme) {
         debug!("Found a storage provider for {scheme} ({location})");
-        let (root_store, _prefix) = entry.value().parse_url_opts(&location, &storage_config)?;
+        let (root_store, _prefix) = entry.value().parse_url_opts(location, &storage_config)?;
         return logstore_with(root_store, location, storage_config);
     }
 
-    Err(DeltaTableError::InvalidTableLocation(location.into()))
+    Err(DeltaTableError::InvalidTableLocation(location.to_string()))
 }
 
 /// Return the [LogStoreRef] using the given [ObjectStoreRef]
 pub fn logstore_with(
     root_store: ObjectStoreRef,
-    location: Url,
+    location: &Url,
     storage_config: StorageConfig,
 ) -> DeltaResult<LogStoreRef> {
     let scheme = Url::parse(&format!("{}://", location.scheme()))
@@ -203,13 +200,11 @@ pub fn logstore_with(
         debug!("Found a logstore provider for {scheme}");
         return factory
             .value()
-            .with_options_internal(root_store, &location, &storage_config);
+            .with_options_internal(root_store, location, &storage_config);
     }
 
     error!("Could not find a logstore for the scheme {scheme}");
-    Err(DeltaTableError::InvalidTableLocation(
-        location.clone().into(),
-    ))
+    Err(DeltaTableError::InvalidTableLocation(location.to_string()))
 }
 
 /// Holder whether it's tmp_commit path or commit bytes
@@ -221,26 +216,29 @@ pub enum CommitOrBytes {
     LogBytes(Bytes),
 }
 
-/// The next commit that's available from underlying storage
-///
-#[derive(Debug)]
-pub enum PeekCommit {
-    /// The next commit version and associated actions
-    New(i64, Vec<Action>),
-    /// Provided DeltaVersion is up to date
-    UpToDate,
-}
-
 /// Configuration parameters for a log store
 #[derive(Debug, Clone)]
 pub struct LogStoreConfig {
     /// url corresponding to the storage location.
-    pub location: Url,
+    location: Url,
     // Options used for configuring backend storage
-    pub options: StorageConfig,
+    options: StorageConfig,
 }
 
 impl LogStoreConfig {
+    pub fn new(location: &Url, options: StorageConfig) -> Self {
+        let location = normalize_table_url(location);
+        Self { location, options }
+    }
+
+    pub fn location(&self) -> &Url {
+        &self.location
+    }
+
+    pub fn options(&self) -> &StorageConfig {
+        &self.options
+    }
+
     pub fn decorate_store<T: ObjectStore + Clone>(
         &self,
         store: T,
@@ -300,19 +298,6 @@ pub trait LogStore: Send + Sync + AsAny {
     /// Find latest version currently stored in the delta log.
     async fn get_latest_version(&self, start_version: i64) -> DeltaResult<i64>;
 
-    /// Get the list of actions for the next commit
-    async fn peek_next_commit(&self, current_version: i64) -> DeltaResult<PeekCommit> {
-        let next_version = current_version + 1;
-        let commit_log_bytes = match self.read_commit_entry(next_version).await {
-            Ok(Some(bytes)) => Ok(bytes),
-            Ok(None) => return Ok(PeekCommit::UpToDate),
-            Err(err) => Err(err),
-        }?;
-
-        let actions = crate::logstore::get_actions(next_version, &commit_log_bytes).await;
-        Ok(PeekCommit::New(next_version, actions?))
-    }
-
     /// Get object store, can pass operation_id for object stores linked to an operation
     fn object_store(&self, operation_id: Option<Uuid>) -> Arc<dyn ObjectStore>;
 
@@ -330,8 +315,8 @@ pub trait LogStore: Send + Sync + AsAny {
     }
 
     /// Get fully qualified uri for table root
-    fn root_uri(&self) -> String {
-        self.to_uri(&Path::from(""))
+    fn root_url(&self) -> &Url {
+        &self.config().location
     }
 
     /// [Path] to Delta log
@@ -339,12 +324,12 @@ pub trait LogStore: Send + Sync + AsAny {
         &DELTA_LOG_PATH
     }
 
-    #[deprecated(
-        since = "0.1.0",
-        note = "DO NOT USE: Just a stop gap to support lakefs during kernel migration"
-    )]
-    fn transaction_url(&self, _operation_id: Uuid, base: &Url) -> DeltaResult<Url> {
-        Ok(base.clone())
+    /// Generate the appropriate [Url] to use for executing an operation.
+    ///
+    ///  This can be useful for branching LogStore implementations such as LakeFS which may return
+    ///  something other than the base URL.
+    fn transaction_url(&self, _operation_id: Option<Uuid>) -> DeltaResult<Url> {
+        Ok(self.config().location().clone())
     }
 
     /// Check if the location is a delta table location
@@ -358,17 +343,17 @@ pub trait LogStore: Send + Sync + AsAny {
             match res {
                 Ok(meta) => {
                     let file_url = dummy_url.join(meta.location.as_ref()).unwrap();
-                    if let Ok(Some(parsed_path)) = ParsedLogPath::try_from(file_url) {
-                        if matches!(
+                    if let Ok(Some(parsed_path)) = ParsedLogPath::try_from(file_url)
+                        && matches!(
                             parsed_path.file_type,
                             LogPathFileType::Commit
                                 | LogPathFileType::SinglePartCheckpoint
-                                | LogPathFileType::UuidCheckpoint(_)
+                                | LogPathFileType::UuidCheckpoint
                                 | LogPathFileType::MultiPartCheckpoint { .. }
                                 | LogPathFileType::CompactedCommit { .. }
-                        ) {
-                            return Ok(true);
-                        }
+                        )
+                    {
+                        return Ok(true);
                     }
                     continue;
                 }
@@ -455,10 +440,6 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
         T::get_latest_version(self, start_version).await
     }
 
-    async fn peek_next_commit(&self, current_version: i64) -> DeltaResult<PeekCommit> {
-        T::peek_next_commit(self, current_version).await
-    }
-
     fn object_store(&self, operation_id: Option<Uuid>) -> Arc<dyn ObjectStore> {
         T::object_store(self, operation_id)
     }
@@ -475,8 +456,8 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
         T::to_uri(self, location)
     }
 
-    fn root_uri(&self) -> String {
-        T::root_uri(self)
+    fn root_url(&self) -> &Url {
+        T::root_url(self)
     }
 
     fn log_path(&self) -> &Path {
@@ -500,11 +481,11 @@ impl<T: LogStore + ?Sized> LogStore for Arc<T> {
 pub(crate) fn get_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
     let handle = tokio::runtime::Handle::current();
     match handle.runtime_flavor() {
-        RuntimeFlavor::MultiThread => Arc::new(DefaultEngine::new(
+        RuntimeFlavor::MultiThread => Arc::new(DefaultEngine::new_with_executor(
             store,
             Arc::new(TokioMultiThreadExecutor::new(handle)),
         )),
-        RuntimeFlavor::CurrentThread => Arc::new(DefaultEngine::new(
+        RuntimeFlavor::CurrentThread => Arc::new(DefaultEngine::new_with_executor(
             store,
             Arc::new(TokioBackgroundExecutor::new()),
         )),
@@ -515,8 +496,16 @@ pub(crate) fn get_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
 #[cfg(feature = "datafusion")]
 fn object_store_url(location: &Url) -> ObjectStoreUrl {
     use object_store::path::DELIMITER;
+
+    // azure storage urls encode the container as user in the url
+    let user_at = match location.username() {
+        u if !u.is_empty() => format!("{u}@"),
+        _ => "".to_string(),
+    };
+
     ObjectStoreUrl::parse(format!(
-        "delta-rs://{}-{}{}",
+        "delta-rs://{}{}-{}{}",
+        user_at,
         location.scheme(),
         location.host_str().unwrap_or("-"),
         location.path().replace(DELIMITER, "-").replace(':', "-")
@@ -533,7 +522,9 @@ pub(crate) fn object_store_path(table_root: &Url) -> DeltaResult<Path> {
     })
 }
 
-/// TODO
+/// Join the given `root` [Url] with the [Path] to produce a URI (String) of the two together.
+///
+/// This is largely a convenience function to help with the nuances of empty [Path] and file [Url]s
 pub fn to_uri(root: &Url, location: &Path) -> String {
     match root.scheme() {
         "file" => {
@@ -557,14 +548,16 @@ pub fn to_uri(root: &Url, location: &Path) -> String {
             if location.as_ref().is_empty() || location.as_ref() == "/" {
                 root.as_ref().to_string()
             } else {
-                format!("{}/{}", root.as_ref(), location.as_ref())
+                root.join(location.as_ref())
+                    .expect("Somehow failed to join on a Url!")
+                    .to_string()
             }
         }
     }
 }
 
 /// Reads a commit and gets list of actions
-pub async fn get_actions(
+pub fn get_actions(
     version: i64,
     commit_log_bytes: &bytes::Bytes,
 ) -> Result<Vec<Action>, DeltaTableError> {
@@ -584,10 +577,9 @@ pub async fn get_actions(
         .collect()
 }
 
-// TODO: maybe a bit of a hack, required to `#[derive(Debug)]` for the operation builders
 impl std::fmt::Debug for dyn LogStore + '_ {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({})", self.name(), self.root_uri())
+        write!(f, "{}({})", self.name(), self.root_url())
     }
 }
 
@@ -660,7 +652,7 @@ pub async fn get_latest_version(
     let storage = log_store.engine(None).storage_handler();
     let log_root = log_store.log_root_url();
 
-    let segment = spawn_blocking(move || {
+    let segment = spawn_blocking_with_span(move || {
         LogSegment::for_table_changes(storage.as_ref(), log_root, current_version as u64, None)
     })
     .await
@@ -745,21 +737,33 @@ pub async fn abort_commit_entry(
 #[cfg(test)]
 pub(crate) mod tests {
     use futures::TryStreamExt;
+    use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn test_logstore_config_ctor() {
+        let location = Url::parse("nonexistent://table/bar").unwrap();
+        let config = LogStoreConfig::new(&location, StorageConfig::default());
+        assert_eq!(config.location().to_string(), "nonexistent://table/bar/");
+        assert_eq!(
+            config.location().join("_delta_log/").unwrap(),
+            Url::parse("nonexistent://table/bar/_delta_log/").unwrap()
+        );
+    }
 
     #[test]
     fn logstore_with_invalid_url() {
         let location = Url::parse("nonexistent://table").unwrap();
 
-        let store = logstore_for(location, StorageConfig::default());
+        let store = logstore_for(&location, StorageConfig::default());
         assert!(store.is_err());
     }
 
     #[test]
     fn logstore_with_memory() {
         let location = Url::parse("memory:///table").unwrap();
-        let store = logstore_for(location, StorageConfig::default());
+        let store = logstore_for(&location, StorageConfig::default());
         assert!(store.is_ok());
     }
 
@@ -767,7 +771,7 @@ pub(crate) mod tests {
     fn logstore_with_memory_and_rt() {
         let location = Url::parse("memory:///table").unwrap();
         let store = logstore_for(
-            location,
+            &location,
             StorageConfig::default().with_io_runtime(IORuntime::default()),
         );
         assert!(store.is_ok());
@@ -776,7 +780,7 @@ pub(crate) mod tests {
     #[test]
     fn test_logstore_ext() {
         let location = Url::parse("memory:///table").unwrap();
-        let store = logstore_for(location, StorageConfig::default()).unwrap();
+        let store = logstore_for(&location, StorageConfig::default()).unwrap();
         let table_url = store.table_root_url();
         assert!(table_url.path().ends_with('/'));
         let log_url = store.log_root_url();
@@ -789,11 +793,13 @@ pub(crate) mod tests {
         use object_store::{PutOptions, PutPayload};
         let location = Url::parse("memory:///table").unwrap();
         let store =
-            logstore_for(location, StorageConfig::default()).expect("Failed to get logstore");
-        assert!(!store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to look at table"));
+            logstore_for(&location, StorageConfig::default()).expect("Failed to get logstore");
+        assert!(
+            !store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to look at table")
+        );
 
         // Let's put a failed commit into the directory and then see if it's still considered a
         // delta table (it shouldn't be).
@@ -807,10 +813,12 @@ pub(crate) mod tests {
             )
             .await
             .expect("Failed to put");
-        assert!(!store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to look at table"));
+        assert!(
+            !store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to look at table")
+        );
     }
 
     #[tokio::test]
@@ -819,11 +827,13 @@ pub(crate) mod tests {
         use object_store::{PutOptions, PutPayload};
         let location = Url::parse("memory:///table").unwrap();
         let store =
-            logstore_for(location, StorageConfig::default()).expect("Failed to get logstore");
-        assert!(!store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to identify table"));
+            logstore_for(&location, StorageConfig::default()).expect("Failed to get logstore");
+        assert!(
+            !store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to identify table")
+        );
 
         // Save a commit to the transaction log
         let payload = PutPayload::from_static(b"test");
@@ -837,10 +847,12 @@ pub(crate) mod tests {
             .await
             .expect("Failed to put");
         // The table should be considered a delta table
-        assert!(store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to identify table"));
+        assert!(
+            store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to identify table")
+        );
     }
 
     #[tokio::test]
@@ -849,11 +861,13 @@ pub(crate) mod tests {
         use object_store::{PutOptions, PutPayload};
         let location = Url::parse("memory:///table").unwrap();
         let store =
-            logstore_for(location, StorageConfig::default()).expect("Failed to get logstore");
-        assert!(!store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to identify table"));
+            logstore_for(&location, StorageConfig::default()).expect("Failed to get logstore");
+        assert!(
+            !store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to identify table")
+        );
 
         // Save a "checkpoint" file to the transaction log directory
         let payload = PutPayload::from_static(b"test");
@@ -867,10 +881,12 @@ pub(crate) mod tests {
             .await
             .expect("Failed to put");
         // The table should be considered a delta table
-        assert!(store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to identify table"));
+        assert!(
+            store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to identify table")
+        );
     }
 
     #[tokio::test]
@@ -879,11 +895,13 @@ pub(crate) mod tests {
         use object_store::{PutOptions, PutPayload};
         let location = Url::parse("memory:///table").unwrap();
         let store =
-            logstore_for(location, StorageConfig::default()).expect("Failed to get logstore");
-        assert!(!store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to identify table"));
+            logstore_for(&location, StorageConfig::default()).expect("Failed to get logstore");
+        assert!(
+            !store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to identify table")
+        );
 
         // Save .crc files to the transaction log directory (all 3 formats)
         let payload = PutPayload::from_static(b"test");
@@ -930,36 +948,12 @@ pub(crate) mod tests {
             .expect("Failed to put");
 
         // The table should be considered a delta table
-        assert!(store
-            .is_delta_table_location()
-            .await
-            .expect("Failed to identify table"));
-    }
-
-    /// <https://github.com/delta-io/delta-rs/issues/3297>:w
-    #[tokio::test]
-    async fn test_peek_with_invalid_json() -> DeltaResult<()> {
-        use crate::logstore::object_store::memory::InMemory;
-        let memory_store = Arc::new(InMemory::new());
-        let log_path = Path::from("delta-table/_delta_log/00000000000000000001.json");
-
-        let log_content = r#"{invalid_json"#;
-
-        memory_store
-            .put(&log_path, log_content.into())
-            .await
-            .expect("Failed to write log file");
-
-        let table_uri = "memory:///delta-table";
-
-        let table = crate::DeltaTableBuilder::from_valid_uri(table_uri)
-            .unwrap()
-            .with_storage_backend(memory_store, Url::parse(table_uri).unwrap())
-            .build()?;
-
-        let result = table.log_store().peek_next_commit(0).await;
-        assert!(result.is_err());
-        Ok(())
+        assert!(
+            store
+                .is_delta_table_location()
+                .await
+                .expect("Failed to identify table")
+        );
     }
 
     /// Collect list stream
@@ -989,6 +983,11 @@ mod datafusion_tests {
             ("s3://my_bucket/path/to/table_1", "file:///path/to/table_1"),
             // Same scheme, different host, same path
             ("s3://bucket_1/table_1", "s3://bucket_2/table_1"),
+            // Azure urls should encode the container
+            (
+                "abfss://container1@host/table_1",
+                "abfss://container2@host/table_1",
+            ),
         ] {
             let url_1 = Url::parse(location_1).unwrap();
             let url_2 = Url::parse(location_2).unwrap();
@@ -1007,7 +1006,7 @@ mod datafusion_tests {
 {"invalid json without closing brace"#,
         );
 
-        let result = get_actions(0, &malformed_json).await;
+        let result = get_actions(0, &malformed_json);
 
         match result {
             Err(DeltaTableError::InvalidJsonLog {

@@ -6,11 +6,11 @@ use object_store::Error as ObjectStoreError;
 use parquet::errors::ParquetError;
 use serde_json::Value;
 
+use crate::DeltaTable;
 use crate::errors::DeltaTableError;
 use crate::kernel::transaction::{CommitBuilder, CommitProperties};
 use crate::kernel::{Action, Add};
 use crate::protocol::{ColumnCountStat, DeltaOperation, SaveMode};
-use crate::DeltaTable;
 
 pub use json::JsonWriter;
 pub use record_batch::RecordBatchWriter;
@@ -32,7 +32,9 @@ pub(crate) enum DeltaWriterError {
     MissingPartitionColumn(String),
 
     /// The Arrow RecordBatch schema does not match the expected schema.
-    #[error("Arrow RecordBatch schema does not match: RecordBatch schema: {record_batch_schema}, {expected_schema}")]
+    #[error(
+        "Arrow RecordBatch schema does not match: RecordBatch schema: {record_batch_schema}, {expected_schema}"
+    )]
     SchemaMismatch {
         /// The record batch schema.
         record_batch_schema: SchemaRef,
@@ -152,7 +154,7 @@ pub trait DeltaWriter<T> {
     /// and commit the changes to the Delta log, creating a new table version.
     async fn flush_and_commit(&mut self, table: &mut DeltaTable) -> Result<i64, DeltaTableError> {
         let adds: Vec<_> = self.flush().await?.drain(..).map(Action::Add).collect();
-        flush_and_commit(adds, table).await
+        flush_and_commit(adds, table, None).await
     }
 }
 
@@ -160,6 +162,7 @@ pub trait DeltaWriter<T> {
 pub(crate) async fn flush_and_commit(
     adds: Vec<Action>,
     table: &mut DeltaTable,
+    commit_properties: Option<CommitProperties>,
 ) -> Result<i64, DeltaTableError> {
     let snapshot = table.snapshot()?;
     let partition_cols = snapshot.metadata().partition_columns().clone();
@@ -174,11 +177,60 @@ pub(crate) async fn flush_and_commit(
         predicate: None,
     };
 
-    let version = CommitBuilder::from(CommitProperties::default())
+    let finalized = CommitBuilder::from(commit_properties.unwrap_or_default())
         .with_actions(adds)
         .build(Some(snapshot), table.log_store.clone(), operation)
-        .await?
-        .version();
-    table.update().await?;
-    Ok(version)
+        .await?;
+    table.state = Some(finalized.snapshot());
+    Ok(finalized.version())
+}
+
+#[cfg(test)]
+mod tests {
+    use delta_kernel::schema::DataType;
+
+    use super::*;
+    use crate::DeltaResult;
+    use pretty_assertions::assert_ne;
+
+    /// This test doesn't have a great way to _validate_ that logs are not cleaned up as part of
+    /// the second commit.
+    ///
+    /// Instead I just added some prints in the [PostCommit] logic to validate that the property
+    /// was getting pulled through correctly in the non-default case.
+    ///
+    /// The _ideal_ testing scenario would probably be to propagate metrics out of
+    /// [flush_and_commit] but that's an API change we isn't desirable at the moment
+    #[tokio::test]
+    async fn test_flush_and_commit() -> DeltaResult<()> {
+        let mut table = DeltaTable::new_in_memory()
+            .create()
+            .with_table_name("my_table")
+            .with_column(
+                "id",
+                DataType::Primitive(delta_kernel::schema::PrimitiveType::Long),
+                true,
+                None,
+            )
+            .with_configuration_property(
+                crate::TableProperty::LogRetentionDuration,
+                Some("interval 0 days"),
+            )
+            .await?;
+
+        let add = Add::default();
+        let actions = vec![Action::Add(add)];
+        let first_version = flush_and_commit(actions, &mut table, None).await?;
+
+        let add = Add::default();
+        let actions = vec![Action::Add(add)];
+
+        let properties = CommitProperties::default().with_cleanup_expired_logs(Some(false));
+        let second_version = flush_and_commit(actions, &mut table, Some(properties)).await?;
+        assert_ne!(
+            second_version, first_version,
+            "flush_and_commit did not create a version apparently?"
+        );
+        Ok(())
+    }
 }

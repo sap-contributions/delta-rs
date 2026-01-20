@@ -13,36 +13,34 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Field, Schema};
 use chrono::{DateTime, Utc};
 use datafusion::catalog::Session;
-use datafusion::common::config::TableParquetOptions;
 use datafusion::common::ScalarValue;
+use datafusion::common::config::TableParquetOptions;
 use datafusion::datasource::memory::DataSourceExec;
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
 };
-use datafusion::physical_expr::{expressions, PhysicalExpr};
+use datafusion::physical_expr::{PhysicalExpr, expressions};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
 use tracing::log;
 
-use crate::delta_datafusion::{register_store, DataFusionMixins};
+use crate::DeltaTableError;
+use crate::delta_datafusion::{DataFusionMixins, register_store};
 use crate::errors::DeltaResult;
 use crate::kernel::transaction::PROTOCOL;
-use crate::kernel::{Action, Add, AddCDCFile, CommitInfo, EagerSnapshot};
-use crate::logstore::{get_actions, LogStoreRef};
-use crate::DeltaTableError;
+use crate::kernel::{Action, Add, AddCDCFile, CommitInfo, EagerSnapshot, resolve_snapshot};
+use crate::logstore::{LogStoreRef, get_actions};
 use crate::{delta_datafusion::cdf::*, kernel::Remove};
 
 /// Builder for create a read of change data feeds for delta tables
 #[derive(Clone)]
 pub struct CdfLoadBuilder {
     /// A snapshot of the to-be-loaded table's state
-    pub snapshot: EagerSnapshot,
+    pub(crate) snapshot: Option<EagerSnapshot>,
     /// Delta object store for handling data files
     log_store: LogStoreRef,
     /// Version to read from
@@ -74,8 +72,8 @@ impl std::fmt::Debug for CdfLoadBuilder {
 }
 
 impl CdfLoadBuilder {
-    /// Create a new [`LoadBuilder`]
-    pub fn new(log_store: LogStoreRef, snapshot: EagerSnapshot) -> Self {
+    /// Create a new [`CdfLoadBuilder`]
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
         Self {
             snapshot,
             log_store,
@@ -124,19 +122,18 @@ impl CdfLoadBuilder {
         self
     }
 
-    async fn calculate_earliest_version(&self) -> DeltaResult<i64> {
+    async fn calculate_earliest_version(&self, snapshot: &EagerSnapshot) -> DeltaResult<i64> {
         let ts = self.starting_timestamp.unwrap_or(DateTime::UNIX_EPOCH);
-        for v in 0..self.snapshot.version() {
-            if let Ok(Some(bytes)) = self.log_store.read_commit_entry(v).await {
-                if let Ok(actions) = get_actions(v, &bytes).await {
-                    if actions.iter().any(|action| {
-                        matches!(action, Action::CommitInfo(CommitInfo {
+        for v in 0..snapshot.version() {
+            if let Ok(Some(bytes)) = self.log_store.read_commit_entry(v).await
+                && let Ok(actions) = get_actions(v, &bytes)
+                && actions.iter().any(|action| {
+                    matches!(action, Action::CommitInfo(CommitInfo {
                             timestamp: Some(t), ..
                         }) if ts.timestamp_millis() < *t)
-                    }) {
-                        return Ok(v);
-                    }
-                }
+                })
+            {
+                return Ok(v);
             }
         }
         Ok(0)
@@ -148,6 +145,7 @@ impl CdfLoadBuilder {
     /// than I have right now. I plan to extend the checks once we have a stable state of the initial implementation.
     async fn determine_files_to_read(
         &self,
+        snapshot: &EagerSnapshot,
     ) -> DeltaResult<(
         Vec<CdcDataSpec<AddCDCFile>>,
         Vec<CdcDataSpec<Add>>,
@@ -159,7 +157,7 @@ impl CdfLoadBuilder {
         let start = if let Some(s) = self.starting_version {
             s
         } else {
-            self.calculate_earliest_version().await?
+            self.calculate_earliest_version(snapshot).await?
         };
 
         let mut change_files: Vec<CdcDataSpec<AddCDCFile>> = vec![];
@@ -209,7 +207,7 @@ impl CdfLoadBuilder {
             .ok_or(DeltaTableError::InvalidVersion(latest_version))?;
 
         let latest_version_actions: Vec<Action> =
-            get_actions(latest_version, &latest_snapshot_bytes).await?;
+            get_actions(latest_version, &latest_snapshot_bytes)?;
         let latest_version_commit = latest_version_actions
             .iter()
             .find(|a| matches!(a, Action::CommitInfo(_)));
@@ -218,14 +216,13 @@ impl CdfLoadBuilder {
             timestamp: Some(latest_timestamp),
             ..
         })) = latest_version_commit
+            && starting_timestamp.timestamp_millis() > *latest_timestamp
         {
-            if starting_timestamp.timestamp_millis() > *latest_timestamp {
-                return if self.allow_out_of_range {
-                    Ok((change_files, add_files, remove_files))
-                } else {
-                    Err(DeltaTableError::ChangeDataTimestampGreaterThanCommit { ending_timestamp })
-                };
-            }
+            return if self.allow_out_of_range {
+                Ok((change_files, add_files, remove_files))
+            } else {
+                Err(DeltaTableError::ChangeDataTimestampGreaterThanCommit { ending_timestamp })
+            };
         }
 
         log::debug!(
@@ -240,7 +237,7 @@ impl CdfLoadBuilder {
                 .await?
                 .ok_or(DeltaTableError::InvalidVersion(version));
 
-            let version_actions: Vec<Action> = get_actions(version, &snapshot_bytes?).await?;
+            let version_actions: Vec<Action> = get_actions(version, &snapshot_bytes?)?;
 
             let mut ts = 0;
             let mut cdc_actions = vec![];
@@ -254,13 +251,11 @@ impl CdfLoadBuilder {
                 if let Some(Action::CommitInfo(CommitInfo {
                     timestamp: Some(t), ..
                 })) = version_commit
+                    && (starting_timestamp.timestamp_millis() > *t
+                        || *t > ending_timestamp.timestamp_millis())
                 {
-                    if starting_timestamp.timestamp_millis() > *t
-                        || *t > ending_timestamp.timestamp_millis()
-                    {
-                        log::debug!("Version: {version} skipped, due to commit timestamp");
-                        continue;
-                    }
+                    log::debug!("Version: {version} skipped, due to commit timestamp");
+                    continue;
                 }
             }
 
@@ -351,13 +346,14 @@ impl CdfLoadBuilder {
         session: &dyn Session,
         filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> DeltaResult<Arc<dyn ExecutionPlan>> {
-        PROTOCOL.can_read_from(&self.snapshot)?;
+        let snapshot = resolve_snapshot(&self.log_store, self.snapshot.clone(), true, None).await?;
+        PROTOCOL.can_read_from(&snapshot)?;
 
-        let (cdc, add, remove) = self.determine_files_to_read().await?;
+        let (cdc, add, remove) = self.determine_files_to_read(&snapshot).await?;
         register_store(self.log_store.clone(), session.runtime_env().as_ref());
 
-        let partition_values = self.snapshot.metadata().partition_columns().clone();
-        let schema = self.snapshot.input_schema();
+        let partition_values = snapshot.metadata().partition_columns().clone();
+        let schema = snapshot.input_schema();
         let schema_fields: Vec<Arc<Field>> = schema
             .fields()
             .into_iter()
@@ -446,8 +442,7 @@ impl CdfLoadBuilder {
 
         // The output batches are then unioned to create a single output. Coalesce partitions is only here for the time
         // being for development. I plan to parallelize the reads once the base idea is correct.
-        let union_scan: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![cdc_scan, add_scan, remove_scan]));
+        let union_scan = UnionExec::try_new(vec![cdc_scan, add_scan, remove_scan])?;
 
         // We project the union in the order of the input_schema + cdc cols at the end
         // This is to ensure the DeltaCdfTableProvider uses the correct schema construction.
@@ -478,22 +473,6 @@ impl CdfLoadBuilder {
     }
 }
 
-#[allow(unused)]
-/// Helper function to collect batches associated with reading CDF data
-pub(crate) async fn collect_batches(
-    num_partitions: usize,
-    stream: Arc<dyn ExecutionPlan>,
-    ctx: SessionContext,
-) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
-    let mut batches = vec![];
-    for p in 0..num_partitions {
-        let data: Vec<RecordBatch> =
-            crate::operations::collect_sendable_stream(stream.execute(p, ctx.task_ctx())?).await?;
-        batches.extend_from_slice(&data);
-    }
-    Ok(batches)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -503,13 +482,14 @@ pub(crate) mod tests {
     use arrow_schema::Schema;
     use chrono::NaiveDateTime;
     use datafusion::common::assert_batches_sorted_eq;
+    use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use itertools::Itertools;
 
     use crate::test_utils::TestSchemas;
     use crate::writer::test_utils::TestResult;
-    use crate::{DeltaOps, DeltaTable, TableProperty};
+    use crate::{DeltaTable, TableProperty};
     use std::path::Path;
     use url::Url;
 
@@ -519,19 +499,14 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_version(0)
             .build(&ctx.state(), None)
             .await?;
 
-        let batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table,
-            ctx,
-        )
-        .await?;
+        let batches = collect(table, ctx.task_ctx()).await?;
         assert_batches_sorted_eq! {
             [
                 "+----+--------+------------+------------------+-----------------+-------------------------+",
@@ -572,21 +547,16 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_version(0)
             .with_ending_timestamp(starting_timestamp.and_utc())
             .build(&ctx.state(), None)
             .await
             .unwrap();
 
-        let batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table,
-            ctx,
-        )
-        .await?;
+        let batches = collect(table, ctx.task_ctx()).await?;
 
         assert_batches_sorted_eq! {
             [
@@ -622,19 +592,14 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table-non-partitioned");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_version(0)
             .build(&ctx.state(), None)
             .await?;
 
-        let batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table,
-            ctx,
-        )
-        .await?;
+        let batches = collect(table, ctx.task_ctx()).await?;
 
         assert_batches_sorted_eq! {
             ["+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+-------------------------+",
@@ -677,9 +642,9 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table-non-partitioned");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_version(4)
             .with_ending_version(1)
             .build(&ctx.state(), None)
@@ -700,9 +665,9 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table-non-partitioned");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_version(5)
             .build(&ctx.state(), None)
             .await;
@@ -722,20 +687,15 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table-non-partitioned");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_version(5)
             .with_allow_out_of_range()
             .build(&ctx.state(), None)
             .await?;
 
-        let batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table.clone(),
-            ctx,
-        )
-        .await?;
+        let batches = collect(table, ctx.task_ctx()).await?;
 
         assert!(batches.is_empty());
 
@@ -749,9 +709,9 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table-non-partitioned");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_timestamp(ending_timestamp.and_utc())
             .build(&ctx.state(), None)
             .await;
@@ -772,20 +732,15 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/cdf-table-non-partitioned");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_timestamp(ending_timestamp.and_utc())
             .with_allow_out_of_range()
             .build(&ctx.state(), None)
             .await?;
 
-        let batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table.clone(),
-            ctx,
-        )
-        .await?;
+        let batches = collect(table, ctx.task_ctx()).await?;
 
         assert!(batches.is_empty());
 
@@ -798,9 +753,9 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/simple_table");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_version(0)
             .build(&ctx.state(), None)
             .await;
@@ -821,19 +776,14 @@ pub(crate) mod tests {
         let table_path = Path::new("../test/tests/data/checkpoint-cdf-table");
         let table_uri =
             Url::from_directory_path(std::fs::canonicalize(table_path).unwrap()).unwrap();
-        let table = DeltaOps::try_from_uri(table_uri)
+        let table = DeltaTable::try_from_url(table_uri)
             .await?
-            .load_cdf()
+            .scan_cdf()
             .with_starting_timestamp(ending_timestamp.and_utc())
             .build(&ctx.state(), None)
             .await?;
 
-        let batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table,
-            ctx,
-        )
-        .await?;
+        let batches = collect(table, ctx.task_ctx()).await?;
 
         assert_batches_sorted_eq! {
             [
@@ -864,7 +814,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_use_remove_actions_for_deletions() -> TestResult {
         let delta_schema = TestSchemas::simple();
-        let table: DeltaTable = DeltaOps::new_in_memory()
+        let table: DeltaTable = DeltaTable::new_in_memory()
             .create()
             .with_columns(delta_schema.fields().cloned())
             .with_partition_columns(["id"])
@@ -899,13 +849,13 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let table = DeltaOps(table)
+        let table = table
             .write(vec![batch])
             .await
             .expect("Failed to write first batch");
         assert_eq!(table.version(), Some(1));
 
-        let table = DeltaOps(table)
+        let table = table
             .write([second_batch])
             .with_save_mode(crate::protocol::SaveMode::Overwrite)
             .await
@@ -913,23 +863,17 @@ pub(crate) mod tests {
         assert_eq!(table.version(), Some(2));
 
         let ctx = SessionContext::new();
-        let cdf_scan = DeltaOps(table.clone())
-            .load_cdf()
+        let cdf_scan = table
+            .clone()
+            .scan_cdf()
             .with_starting_version(0)
             .build(&ctx.state(), None)
             .await
             .expect("Failed to load CDF");
 
-        let mut batches = collect_batches(
-            cdf_scan
-                .properties()
-                .output_partitioning()
-                .partition_count(),
-            cdf_scan,
-            ctx,
-        )
-        .await
-        .expect("Failed to collect batches");
+        let mut batches = collect(cdf_scan, ctx.task_ctx())
+            .await
+            .expect("Failed to collect batches");
 
         // The batches will contain a current _commit_timestamp which shouldn't be check_append_only
         let _: Vec<_> = batches.iter_mut().map(|b| b.remove_column(5)).collect();
@@ -953,7 +897,7 @@ pub(crate) mod tests {
             .read_commit_entry(2)
             .await?
             .expect("failed to get snapshot bytes");
-        let version_actions = get_actions(2, &snapshot_bytes).await?;
+        let version_actions = get_actions(2, &snapshot_bytes)?;
 
         let cdc_actions = version_actions
             .iter()
