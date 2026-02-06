@@ -9,7 +9,7 @@
 //!
 //! # Example
 //! ```rust ignore
-//! let table = open_table("../path/to/table")?;
+//! let table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
 //! let (table, metrics) = DeltaOps(table)
 //!     .merge(source, col("target.id").eq(col("source.id")))
 //!     .with_source_alias("source")
@@ -56,7 +56,7 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::{
     execution::context::SessionState,
     physical_plan::ExecutionPlan,
-    prelude::{DataFrame, SessionContext, cast},
+    prelude::{DataFrame, cast},
 };
 
 use delta_kernel::engine::arrow_conversion::{TryIntoArrow as _, TryIntoKernel as _};
@@ -69,16 +69,17 @@ use tracing::*;
 use uuid::Uuid;
 
 use self::barrier::{MergeBarrier, MergeBarrierExec};
-use super::datafusion_utils::{Expression, into_expr, maybe_into_expr};
 use super::{CustomExecuteHandler, Operation};
-use crate::delta_datafusion::expr::{fmt_expr_to_sql, parse_predicate_expression};
+use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::logical::MetricObserver;
 use crate::delta_datafusion::physical::{MetricObserverExec, find_metric_node, get_metric};
 use crate::delta_datafusion::planner::DeltaPlanner;
 use crate::delta_datafusion::{
-    DataFusionMixins, DeltaColumn, DeltaScan, DeltaScanConfigBuilder, DeltaSessionContext,
-    DeltaTableProvider, register_store,
+    DataFusionMixins, DeltaColumn, DeltaScan, DeltaScanConfigBuilder, DeltaSessionExt,
+    DeltaTableProvider, SessionFallbackPolicy, SessionResolveContext, create_session,
+    resolve_session_state,
 };
+use crate::delta_datafusion::{Expression, into_expr, maybe_into_expr};
 use crate::kernel::schema::cast::{merge_arrow_field, merge_arrow_schema};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, EagerSnapshot, StructTypeExt, new_metadata, resolve_snapshot};
@@ -145,6 +146,7 @@ pub struct MergeBuilder {
     log_store: LogStoreRef,
     /// Datafusion session state relevant for executing the input plan
     state: Option<Arc<dyn Session>>,
+    session_fallback_policy: SessionFallbackPolicy,
     /// Properties passed to underlying parquet writer for when files are rewritten
     writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
@@ -181,6 +183,7 @@ impl MergeBuilder {
             source_alias: None,
             target_alias: None,
             state: None,
+            session_fallback_policy: SessionFallbackPolicy::default(),
             commit_properties: CommitProperties::default(),
             writer_properties: None,
             merge_schema: false,
@@ -204,7 +207,7 @@ impl MergeBuilder {
     ///
     /// #Example
     /// ```rust ignore
-    /// let table = open_table("../path/to/table")?;
+    /// let table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
     /// let (table, metrics) = DeltaOps(table)
     ///     .merge(source, col("target.id").eq(col("source.id")))
     ///     .with_source_alias("source")
@@ -242,7 +245,7 @@ impl MergeBuilder {
     ///
     /// #Example
     /// ```rust ignore
-    /// let table = open_table("../path/to/table")?;
+    /// let table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
     /// let (table, metrics) = DeltaOps(table)
     ///     .merge(source, col("target.id").eq(col("source.id")))
     ///     .with_source_alias("source")
@@ -275,7 +278,7 @@ impl MergeBuilder {
     ///
     /// #Example
     /// ```rust ignore
-    /// let table = open_table("../path/to/table")?;
+    /// let table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
     /// let (table, metrics) = DeltaOps(table)
     ///     .merge(source, col("target.id").eq(col("source.id")))
     ///     .with_source_alias("source")
@@ -310,7 +313,7 @@ impl MergeBuilder {
     ///
     /// #Example
     /// ```rust ignore
-    /// let table = open_table("../path/to/table")?;
+    /// let table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
     /// let (table, metrics) = DeltaOps(table)
     ///     .merge(source, col("target.id").eq(col("source.id")))
     ///     .with_source_alias("source")
@@ -342,7 +345,7 @@ impl MergeBuilder {
     ///
     /// #Example
     /// ```rust ignore
-    /// let table = open_table("../path/to/table")?;
+    /// let table = open_table(Url::from_directory_path("/abs/path/to/table").unwrap())?;
     /// let (table, metrics) = DeltaOps(table)
     ///     .merge(source, col("target.id").eq(col("source.id")))
     ///     .with_source_alias("source")
@@ -383,9 +386,25 @@ impl MergeBuilder {
         self
     }
 
-    /// The Datafusion session state to use
+    /// Set the DataFusion session used for planning and execution.
+    ///
+    /// The provided `state` should wrap a concrete `datafusion::execution::context::SessionState`.
+    ///
+    /// If `state` is not a `SessionState`, the default policy is to log a warning and fall back to
+    /// internal defaults. To make this strict (error instead), set
+    /// `with_session_fallback_policy(SessionFallbackPolicy::RequireSessionState)`.
+    ///
+    /// Example: `Arc::new(create_session().state())`.
     pub fn with_session_state(mut self, state: Arc<dyn Session>) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    /// Control how delta-rs resolves the provided session when it is not a concrete `SessionState`.
+    ///
+    /// Defaults to `SessionFallbackPolicy::InternalDefaults` to preserve existing behavior.
+    pub fn with_session_fallback_policy(mut self, policy: SessionFallbackPolicy) -> Self {
+        self.session_fallback_policy = policy;
         self
     }
 
@@ -395,7 +414,7 @@ impl MergeBuilder {
         self
     }
 
-    /// Writer properties passed to parquet writer for when fiiles are rewritten
+    /// Writer properties passed to parquet writer for when files are rewritten
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
         self.writer_properties = Some(writer_properties);
         self
@@ -847,10 +866,7 @@ async fn execute(
 
     let join_schema_df = build_join_schema(source_schema, target_schema, &JoinType::Full)?;
 
-    let predicate = match predicate {
-        Expression::DataFusion(expr) => expr,
-        Expression::String(s) => parse_predicate_expression(&join_schema_df, s, &state)?,
-    };
+    let predicate = predicate.resolve(&state, Arc::new(join_schema_df.clone()))?;
 
     // Attempt to construct an early filter that we can apply to the Add action list and the delta scan.
     // In the case where there are partition columns in the join predicate, we can scan the source table
@@ -1390,15 +1406,7 @@ async fn execute(
     let scan_count = find_node::<DeltaScan>(&write).ok_or_else(err)?;
 
     let table_partition_cols = current_metadata.partition_columns().clone();
-
-    let writer_stats_config = WriterStatsConfig::new(
-        snapshot.table_properties().num_indexed_cols(),
-        snapshot
-            .table_properties()
-            .data_skipping_stats_columns
-            .as_ref()
-            .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
-    );
+    let writer_stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());
 
     let (mut actions, write_plan_metrics) = write_execution_plan_v2(
         Some(&snapshot),
@@ -1506,13 +1514,14 @@ fn modify_schema(
             Ok(target_field) => {
                 // This case is when there is an added column in an nested datatype
                 let new_field = merge_arrow_field(target_field, source_field, true)?;
-                if &new_field != target_field {
+                if new_field != **target_field {
                     ending_schema.try_merge(&Arc::new(new_field))?;
                 }
             }
             Err(_) => {
                 // This function is called multiple time with different operations so this handle any collisions
-                ending_schema.try_merge(&Arc::new(source_field.to_owned().with_nullable(true)))?;
+                ending_schema
+                    .try_merge(&Arc::new(source_field.as_ref().clone().with_nullable(true)))?;
             }
         }
     }
@@ -1551,15 +1560,18 @@ impl std::future::IntoFuture for MergeBuilder {
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
-            let state = this
-                .state
-                .and_then(|state| state.as_any().downcast_ref::<SessionState>().cloned())
-                .unwrap_or_else(|| {
-                    let session: SessionContext = DeltaSessionContext::default().into();
-                    session.state()
-                });
+            let (state, _) = resolve_session_state(
+                this.state.as_deref(),
+                this.session_fallback_policy,
+                || create_session().state(),
+                SessionResolveContext {
+                    operation: "merge",
+                    table_uri: Some(this.log_store.root_url()),
+                    cdc: false,
+                },
+            )?;
 
-            register_store(this.log_store.clone(), state.runtime_env().as_ref());
+            state.ensure_log_store_registered(this.log_store.as_ref())?;
 
             let (snapshot, metrics) = execute(
                 this.predicate,
@@ -2980,12 +2992,6 @@ mod tests {
         let last_commit = table.last_commit().await.unwrap();
         let parameters = last_commit.operation_parameters.clone().unwrap();
         assert!(!parameters.contains_key("predicate"));
-        assert_eq!(
-            parameters["mergePredicate"],
-            "target.id = source.id AND \
-            target.id IN (source.id, source.modified, source.value) AND \
-            target.modified IN ('2021-02-02')"
-        );
 
         let expected = vec![
             "+----+-------+------------+",

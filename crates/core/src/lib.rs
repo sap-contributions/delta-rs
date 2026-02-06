@@ -7,7 +7,7 @@
 //! ```rust
 //! # use url::Url;
 //! async {
-//!   let table_url = Url::from_directory_path("../test/tests/data/simple_table").unwrap();
+//!   let table_url = Url::from_directory_path("/abs/test/tests/data/simple_table").unwrap();
 //!   let table = deltalake_core::open_table(table_url).await.unwrap();
 //!   let version = table.version();
 //! };
@@ -18,7 +18,7 @@
 //! ```rust
 //! # use url::Url;
 //! async {
-//!   let table_url = Url::from_directory_path("../test/tests/data/simple_table").unwrap();
+//!   let table_url = Url::from_directory_path("/abs/test/tests/data/simple_table").unwrap();
 //!   let table = deltalake_core::open_table_with_version(table_url, 0).await.unwrap();
 //!   let filter = [deltalake_core::PartitionFilter {
 //!       key: "month".to_string(),
@@ -62,7 +62,7 @@
 //! async {
 //!   use datafusion::prelude::SessionContext;
 //!   let mut ctx = SessionContext::new();
-//!   let table_url = Url::from_directory_path("../test/tests/data/simple_table").unwrap();
+//!   let table_url = Url::from_directory_path("/abs/test/tests/data/simple_table").unwrap();
 //!   let table = deltalake_core::open_table(table_url)
 //!       .await
 //!       .unwrap();
@@ -108,6 +108,7 @@ pub use self::table::builder::{
 };
 pub use self::table::config::TableProperty;
 pub use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStore, path::Path};
+#[allow(deprecated)]
 pub use operations::DeltaOps;
 
 pub use protocol::checkpoints;
