@@ -100,23 +100,9 @@ impl DisplayAs for DeltaScanMetaExec {
 }
 
 impl DeltaScanMetaExec {
-    fn output_schema(scan_plan: &KernelScanPlan) -> SchemaRef {
-        // Row index projection requires row ordinals from each file. Planning
-        // routes it to DeltaScanExec.
-        debug_assert!(
-            !scan_plan.contract.retain_row_index,
-            "metadata scan cannot satisfy row index projection"
-        );
-        if scan_plan.contract.retain_file_id {
-            Arc::clone(&scan_plan.contract.output_schema)
-        } else {
-            Arc::clone(&scan_plan.contract.result_schema)
-        }
-    }
-
     fn make_properties(scan_plan: &KernelScanPlan, partition_count: usize) -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(Self::output_schema(scan_plan)),
+            EquivalenceProperties::new(scan_plan.output_schema.clone()),
             Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -132,8 +118,7 @@ impl DeltaScanMetaExec {
         file_id_field: Option<FieldRef>,
         metrics: ExecutionPlanMetricsSet,
     ) -> Self {
-        debug_assert_eq!(file_id_field.is_some(), scan_plan.contract.retain_file_id);
-        let properties = Arc::new(Self::make_properties(scan_plan.as_ref(), input.len()));
+        let properties = Self::make_properties(scan_plan.as_ref(), input.len());
         Self {
             scan_plan,
             input,
@@ -235,10 +220,7 @@ impl ExecutionPlan for DeltaScanMetaExec {
             .into_iter()
             .map(|chunk| chunk.collect())
             .collect();
-        let properties = Arc::new(Self::make_properties(
-            self.scan_plan.as_ref(),
-            new_input.len(),
-        ));
+        let properties = Self::make_properties(self.scan_plan.as_ref(), new_input.len());
 
         Ok(Some(Arc::new(Self {
             properties,
@@ -274,6 +256,10 @@ impl ExecutionPlan for DeltaScanMetaExec {
         Some(self.metrics.clone_inner())
     }
 
+    fn statistics(&self) -> Result<Statistics> {
+        self.partition_statistics(None)
+    }
+
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
@@ -290,12 +276,12 @@ impl ExecutionPlan for DeltaScanMetaExec {
         None
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        Ok(Arc::new(Statistics {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        Ok(Statistics {
             num_rows: Precision::Exact(self.exact_num_rows(partition)?),
             total_byte_size: Precision::Absent,
             column_statistics: Statistics::unknown_column(self.schema().as_ref()),
-        }))
+        })
     }
 
     fn gather_filters_for_pushdown(
@@ -684,7 +670,7 @@ mod tests {
             .scan(&session.state(), Some(&empty_projection), &[], None)
             .await?;
         assert!(
-            scan.downcast_ref::<DeltaScanMetaExec>().is_some(),
+            scan.as_any().downcast_ref::<DeltaScanMetaExec>().is_some(),
             "expected metadata-only scan\n{diagnostics}"
         );
         assert_eq!(
@@ -977,29 +963,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_meta_only_scan_excludes_unprojected_file_id_from_reported_schema() -> TestResult {
-        let table = open_fs_path("../../dat/v0.0.3/reader_tests/generated/multi_partitioned/delta");
-        let provider = table.table_provider().with_file_column("file_id").await?;
-        let session = Arc::new(create_session().into_inner());
-        let data_idx = provider.schema().index_of("data").unwrap();
-
-        let scan = provider
-            .scan(&session.state(), Some(&vec![data_idx]), &[], None)
-            .await?;
-        let downcast = scan.downcast_ref::<DeltaScanMetaExec>();
-        assert!(downcast.is_some());
-        assert_eq!(
-            scan.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect_vec(),
-            vec!["data"]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_meta_only_count_on_partitioned_written_table_counts_rows_not_files() -> TestResult
     {
         let (_table_dir, table) = write_single_file_per_partition_repro_table().await?;
@@ -1110,21 +1073,12 @@ mod tests {
             .scan(&session.state(), Some(&empty_projection), &[], None)
             .await?;
         let template = scan
+            .as_any()
             .downcast_ref::<DeltaScanMetaExec>()
             .expect("expected metadata-only scan");
 
         let selection_vectors: Arc<DashMap<String, Vec<bool>>> = Arc::new(DashMap::new());
         selection_vectors.insert("f2".to_string(), vec![true, false, true, false]);
-        let public_file_ids = Arc::new(
-            [
-                ("f1".to_string(), "f1".to_string()),
-                ("f2".to_string(), "f2".to_string()),
-                ("f3".to_string(), "f3".to_string()),
-                ("f4".to_string(), "f4".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-        );
 
         let exec = DeltaScanMetaExec::new(
             Arc::clone(&template.scan_plan),
@@ -1136,7 +1090,6 @@ mod tests {
             ])],
             Arc::clone(&template.transforms),
             selection_vectors,
-            public_file_ids,
             template.file_id_field.clone(),
             ExecutionPlanMetricsSet::new(),
         );
@@ -1153,6 +1106,7 @@ mod tests {
         );
 
         let repartitioned = repartitioned
+            .as_any()
             .downcast_ref::<DeltaScanMetaExec>()
             .expect("expected repartitioned DeltaScanMetaExec");
         assert_eq!(repartitioned.input.len(), 2);
