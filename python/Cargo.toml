@@ -121,6 +121,7 @@ features = [
     "opendal-ftp",
     "opendal-sftp",
     "opendal-hf",
+    "hdlfs",
 ]
 
 [features]

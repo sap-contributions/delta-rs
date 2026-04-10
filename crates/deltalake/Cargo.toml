@@ -22,6 +22,7 @@ features = [
     "python",
     "s3",
     "unity-experimental",
+    "hdlfs",
 ]
 
 [dependencies]
@@ -34,6 +35,7 @@ deltalake-opendal = { version = "1.0", path = "../opendal", default-features = f
 deltalake-lakefs = { version = "1.0", path = "../lakefs", optional = true }
 deltalake-catalog-glue = { version = "1.0", path = "../catalog-glue", optional = true }
 deltalake-catalog-unity = { version = "1.0", path = "../catalog-unity", optional = true }
+deltalake-hdlfs = { version = "0.1.0", path = "../hdlfs", optional = true }
 delta_kernel = { workspace = true }
 ctor = "0.10"
 
@@ -76,6 +78,7 @@ opendal-hf = ["opendal", "deltalake-opendal/opendal-hf", "deltalake-opendal/rust
 lakefs = ["deltalake-lakefs"]
 native-tls = ["deltalake-core/native-tls"]
 rustls = ["deltalake-core/rustls"]
+hdlfs =  ["deltalake-hdlfs"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
