@@ -119,6 +119,7 @@ features = [
     "opendal-webdav",
     "opendal-ftp",
     "opendal-hf",
+    "hdlfs",
 ]
 
 # SFTP support needs `openssh`, a Unix dependency.
