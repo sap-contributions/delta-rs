@@ -279,6 +279,12 @@ impl Default for DeltaSessionConfig {
             inner: SessionConfig::default()
                 .set_bool("datafusion.sql_parser.enable_ident_normalization", false)
                 .set_bool("datafusion.execution.parquet.schema_force_view_types", true)
+                // Coerce Parquet INT96 timestamps to microsecond precision instead of nanosecond.
+                // INT96 is Spark's default timestamp storage format. Nanosecond precision overflows
+                // int64 for dates beyond 2262-04-11, corrupting SAP high-dates like 9999-12-31.
+                // Microsecond precision supports dates up to year ~292,277 and aligns with the
+                // Delta Lake timestamp specification.
+                .set_str("datafusion.execution.parquet.coerce_int96", "us")
                 // Workaround: hash-join dynamic filtering (IN-list pushdown) can panic when join
                 // keys include dictionary arrays (still reproducible with DF 52.1.x crates).
                 // Disable IN-list pushdown and fall back to hash lookups.
