@@ -100,9 +100,21 @@ impl DisplayAs for DeltaScanMetaExec {
 }
 
 impl DeltaScanMetaExec {
+    fn output_schema(scan_plan: &KernelScanPlan) -> SchemaRef {
+        debug_assert!(
+            !scan_plan.contract.retain_row_index,
+            "metadata scan cannot satisfy row index projection"
+        );
+        if scan_plan.contract.retain_file_id {
+            Arc::clone(&scan_plan.contract.output_schema)
+        } else {
+            Arc::clone(&scan_plan.contract.result_schema)
+        }
+    }
+
     fn make_properties(scan_plan: &KernelScanPlan, partition_count: usize) -> PlanProperties {
         PlanProperties::new(
-            EquivalenceProperties::new(scan_plan.output_schema.clone()),
+            EquivalenceProperties::new(Self::output_schema(scan_plan)),
             Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -118,7 +130,7 @@ impl DeltaScanMetaExec {
         file_id_field: Option<FieldRef>,
         metrics: ExecutionPlanMetricsSet,
     ) -> Self {
-        let properties = Self::make_properties(scan_plan.as_ref(), input.len());
+        let properties = Arc::new(Self::make_properties(scan_plan.as_ref(), input.len()));
         Self {
             scan_plan,
             input,
@@ -220,7 +232,7 @@ impl ExecutionPlan for DeltaScanMetaExec {
             .into_iter()
             .map(|chunk| chunk.collect())
             .collect();
-        let properties = Self::make_properties(self.scan_plan.as_ref(), new_input.len());
+        let properties = Arc::new(Self::make_properties(self.scan_plan.as_ref(), new_input.len()));
 
         Ok(Some(Arc::new(Self {
             properties,
@@ -256,10 +268,6 @@ impl ExecutionPlan for DeltaScanMetaExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        self.partition_statistics(None)
-    }
-
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
@@ -276,12 +284,12 @@ impl ExecutionPlan for DeltaScanMetaExec {
         None
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.exact_num_rows(partition)?),
             total_byte_size: Precision::Absent,
             column_statistics: Statistics::unknown_column(self.schema().as_ref()),
-        })
+        }))
     }
 
     fn gather_filters_for_pushdown(
