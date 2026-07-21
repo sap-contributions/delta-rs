@@ -79,11 +79,6 @@ impl LogStoreFactory for HdlfsFactory {
 
 /// Register an [ObjectStoreFactory] for common Hdlfs [Url] schemes
 pub fn register_handlers(_additional_prefixes: Option<Url>) {
-    eprintln!(
-        "{}",
-        "Registering **** hdlfs ****** call register_handlers..."
-    );
-
     let factory = Arc::new(HdlfsFactory {});
     let scheme = &"hdlfs";
     let url = Url::parse(&format!("{scheme}://")).unwrap();
