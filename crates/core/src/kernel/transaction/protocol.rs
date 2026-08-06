@@ -324,6 +324,12 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::DeletionVectors);
     // writer_features.insert(TableFeature::IdentityColumns);
 
+    // Declare support for clustered tables (liquid clustering). Metadata-only
+    // from delta-rs's POV: it does not re-cluster data, but must accept writes
+    // to tables carrying these writer features so downstream engines cluster.
+    writer_features.insert(TableFeature::DomainMetadata);
+    writer_features.insert(TableFeature::ClusteredTable);
+
     ProtocolChecker::new(reader_features, writer_features)
 });
 

@@ -161,4 +161,4 @@ lto = "thin"
 
 [patch.crates-io]
 object_store = { git = "https://github.com/sap-contributions/arrow-rs-object-store.git", branch = "hdlfs-16x-013x"}
-#object_store = { path = "/usr/local/simon/o-opensource/opensource-arrow-rs-object-store" }
+#object_store = { path = "/usr/local/simon/9-rust/arrow-rs-object-store" }
